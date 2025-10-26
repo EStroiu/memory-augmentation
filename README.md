@@ -33,16 +33,16 @@ Common invocations (run from repo root):
 
 ```bash
 # Baseline vs current (nearest neighbor + template by default)
-python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --policy nn --memory_format template
+python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --policy nn --memory_format template --outdir outputs/eval
 
 # Try temporally-weighted re-ranking
-python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --policy temporal --alpha 0.5
+python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --policy temporal --alpha 0.5 --outdir outputs/eval
 
 # Use template + heuristic summary as memory format
-python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --memory_format template+summary
+python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --memory_format template+summary --outdir outputs/eval
 
 # Limit to a few games for a quick smoke test
-python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --max_games 5
+python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --k 3 --max_games 5 --outdir outputs/eval
 ```
 
 Outputs are saved under `outputs/eval/<timestamp>_k-.../` and include:
