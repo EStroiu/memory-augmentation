@@ -2,6 +2,9 @@
 """
 Evaluate retrieval and prompting pipeline over an Avalon dataset.
 
+Run this script from the repository root (after installing requirements).
+Typical usage examples are in the top-level README.
+
 Features:
 - Runs retrieval probes (Recall@k, MRR) across all games in a dataset directory
 - Supports two retrieval policies: nearest-neighbor (nn) and temporally-weighted (temporal)
@@ -12,9 +15,9 @@ Features:
   * Recall@k bar, MRR bar
   * Prompt-length comparison
 
-Usage:
-  python scripts/evaluate_pipeline.py \
-    --data_dir dataset \
+Usage (from repo root):
+    python scripts/evaluate_pipeline.py \
+    --data_dir avalon-nlu/dataset \
     --k 3 \
     --policy nn \
     --memory_format template \
