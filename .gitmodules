@@ -1,0 +1,3 @@
+[submodule "avalon-nlu"]
+	path = avalon-nlu
+	url = https://github.com/sstepput/Avalon-NLU.git
