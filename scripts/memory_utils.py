@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Shared utilities for building Avalon memory entries, embeddings, retrieval, and prompt assembly.
+
+This module is imported by the command-line scripts under `scripts/`. You typically won't run
+this directly; instead, use:
+
+- `python scripts/build_memory_index.py` for a single-game probe
+- `python scripts/evaluate_pipeline.py` to evaluate over the full dataset
 """
 from __future__ import annotations
 
