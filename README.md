@@ -53,13 +53,31 @@ Outputs are saved under `outputs/eval/<timestamp>_k-.../` and include:
 - Visuals (if Plotly available): `recall_bar.html`, `mrr_bar.html`, `prompt_lengths.html`
 
 
-## WIP: call an LLM (stubbed by default)
+## LLM evaluation with memory augmentation (TypeChat-like JSON)
 
-Currenlty the evaluation script includes a placeholder for an OpenAI call for downstream role prediction.
-By default it does nothing. To enable the stub path, you can pass `--llm` and supply an API key;
-however, the call is still a no‑op for safety. Maybe later it will also be used for local models.
+The evaluation script can compare LLM performance with vs without memory augmentation.
+Prompts enforce a TypeChat-like contract: the model must return a one-line JSON object `{ "role": "<ROLE>" }`.
+We validate the role against the dataset’s allowed roles.
+
+Local (Ollama) example:
+
+```bash
+# Ensure Ollama is installed and running, and you have the model pulled, e.g.:
+#   ollama pull llama3:8b-instruct
+python scripts/evaluate_pipeline.py \
+	--data_dir avalon-nlu/dataset \
+	--k 3 \
+	--memory_format template+summary \
+	--outdir outputs/eval \
+	--num_runs 1 \
+	--seed 123 \
+	--llm \
+	--model ollama:llama3:8b-instruct
+```
+
+OpenAI example (stubbed path):
 
 ```bash
 export OPENAI_API_KEY=...   # or pass via --openai-api-key
-python scripts/evaluate_pipeline.py --data_dir dataset --llm --openai-model gpt-4o-mini
+python scripts/evaluate_pipeline.py --data_dir avalon-nlu/dataset --llm --model openai:gpt-4o-mini
 ```
