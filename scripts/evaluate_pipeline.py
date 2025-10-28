@@ -1,37 +1,34 @@
 #!/usr/bin/env python3
 """
-Evaluate retrieval and prompting pipeline over an Avalon dataset.
+Evaluate LLM performance with and without memory augmentation over an Avalon dataset.
 
 Run this script from the repository root (after installing requirements).
 Typical usage examples are in the top-level README.
 
-Features:
-- Runs retrieval probes (Recall@k, MRR) across all games in a dataset directory
-- Supports two retrieval policies: nearest-neighbor (nn) and temporally-weighted (temporal)
-- Supports two memory formats: template-only and template+heuristic-summary
-- Optionally calls an LLM (OpenAI) for downstream role-prediction (stubbed by default)
-- Computes prompt size stats (chars/words/lines) for baseline vs memory-augmented
-- Saves per-run JSON results and Plotly HTML visualizations:
-    * Per-role grouped bars: Recall@k by role, MRR by role
-    * Confusion matrices (baseline/current) for proposer-role prediction proxy
-    * Prompt-length comparison (with_memory vs baseline)
+What this does now (LLM-only focus):
+- Builds a retrieval memory from all games (SentenceTransformers + FAISS NN) to select top-k context for each target round
+- Compares two prompts for the same target: baseline (no memory) vs memory-augmented
+- Calls an LLM (e.g., via Ollama) to predict the proposer role for each round
+- Enforces TypeChat-like structured output: prompts require a strict one-line JSON {"role": "<ROLE>"}; we parse and validate against allowed roles
+- Reports LLM classification metrics: per-role precision/recall/F1, micro-F1, and confusion matrices
+- Tracks prompt size stats (chars/words/lines) for baseline vs memory-augmented
 
-Notes:
-- No per-quest plots are generated.
-- Overall aggregate bars (Recall@k, MRR) are omitted in favor of per-role breakdowns.
+Removed (no longer reported):
+- Retrieval-only metrics (Recall@k, MRR) and their plots
+- Per-quest plots
 
 Usage (from repo root):
         python scripts/evaluate_pipeline.py \
         --data_dir avalon-nlu/dataset \
         --k 3 \
-        --policy nn \
         --memory_format template \
-        --outdir outputs/eval
+        --outdir outputs/eval \
+    --llm --model ollama:llama2:13b
 
 Optional:
-    --policy temporal --alpha 0.5
     --memory_format template+summary
-    --llm --openai-model gpt-4o-mini --openai-api-key $OPENAI_API_KEY
+    --llm --model ollama:llama3:8b-instruct   # any local Ollama model (set OLLAMA_HOST if not default)
+    --llm --model openai:gpt-4o-mini --openai-api-key $OPENAI_API_KEY  # OpenAI path is stubbed by default
 """
 from __future__ import annotations
 
@@ -72,6 +69,12 @@ except Exception:
     go = None  # type: ignore
     plotly_offline_plot = None  # type: ignore
 
+# HTTP client (optional; for Ollama integration)
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
+
 
 # Ensure repo root is importable when running as a script (python scripts/...) 
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
@@ -84,51 +87,115 @@ from scripts.memory_utils import (
     build_embeddings,
     build_faiss_ip_index,
     retrieve_top,
-    rerank_temporal,
     assemble_prompt,
     assemble_baseline_prompt,
     prompt_stats,
-    pca_2d,
 )
 
 
 def llm_role_predict(prompt: str, use_llm: bool, model_name: str, api_key: str | None) -> Dict[str, Any]:
-    """Optional LLM call for role prediction. Stubbed by default."""
+    """Call an LLM to get a raw prediction string.
+
+    Supported providers:
+    - Ollama (local): set model_name to "ollama:<model>" (e.g., "ollama:llama2:13b" or "ollama:llama2:13b-chat").
+      Uses OLLAMA_HOST env (default http://localhost:11434) and POSTs to /api/generate.
+    - OpenAI (stub): model_name starting with "openai:" will attempt to import openai but remains a no-op unless you extend it.
+
+    Returns a dict with keys: prediction (raw text), error (optional), provider.
+    """
     if not use_llm:
-        return {"prediction": None, "cost": 0.0, "tokens": 0}
+        return {"prediction": None, "cost": 0.0, "tokens": 0, "provider": None}
+
+    # Ollama provider
+    if model_name.lower().startswith("ollama:"):
+        if requests is None:
+            return {"prediction": None, "error": "requests not installed; pip install requests", "provider": "ollama"}
+        model = model_name.split(":", 1)[1]
+        base = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        url = base.rstrip("/") + "/api/generate"
+        try:
+            resp = requests.post(url, json={"model": model, "prompt": prompt, "stream": False}, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data.get("response") or data.get("message") or ""
+            return {"prediction": text, "provider": "ollama"}
+        except Exception as e:
+            return {"prediction": None, "error": f"ollama request failed: {e}", "provider": "ollama"}
+
+    # OpenAI (placeholder; extend if desired)
+    if model_name.lower().startswith("openai:"):
+        try:
+            import openai  # type: ignore
+        except Exception:
+            return {"prediction": None, "error": "openai library not installed", "provider": "openai"}
+        if not api_key:
+            return {"prediction": None, "error": "OPENAI_API_KEY not provided", "provider": "openai"}
+        # No-op placeholder: avoid making external calls by default
+        return {"prediction": None, "note": "openai path stubbed; implement as needed", "provider": "openai"}
+
+    return {"prediction": None, "error": "Unknown LLM provider; use model_name starting with 'ollama:' or 'openai:'"}
+
+
+def _parse_json_role(text: str | None) -> str | None:
+    """Try to parse a JSON object like {"role": "..."} from text."""
+    if not text:
+        return None
+    s = text.strip()
+    # first try direct JSON
     try:
-        import openai  # type: ignore
+        obj = json.loads(s)
+        if isinstance(obj, dict) and isinstance(obj.get("role"), str):
+            return obj.get("role")
     except Exception:
-        return {"prediction": None, "error": "openai library not installed", "cost": 0.0, "tokens": 0}
-    if not api_key:
-        return {"prediction": None, "error": "OPENAI_API_KEY not provided", "cost": 0.0, "tokens": 0}
-    # For safety, we keep this as a no-op placeholder.
-    # Implement your actual API call here if desired.
-    return {"prediction": None, "note": "stubbed"}
+        pass
+    # try to extract JSON substring
+    try:
+        m = re.search(r"\{[^{}]*\}", s, flags=re.DOTALL)
+        if m:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict) and isinstance(obj.get("role"), str):
+                return obj.get("role")
+    except Exception:
+        pass
+    return None
+
+
+def extract_role_label(text: str | None, valid_roles: List[str]) -> str | None:
+    """Parse TypeChat-like JSON first, then fall back to fuzzy label extraction.
+
+    1) Parse JSON {"role": "<ROLE>"} and validate against valid_roles.
+    2) Fallback: contains/word-boundary matching.
+    """
+    # Step 1: JSON
+    role = _parse_json_role(text)
+    if role and valid_roles:
+        # map case-insensitively to a canonical valid role
+        for vr in valid_roles:
+            if role.strip().lower() == vr.lower():
+                return vr
+    # Step 2: fuzzy
+    if not text:
+        return None
+    t = text.strip()
+    tl = t.lower()
+    hits = [r for r in valid_roles if r.lower() in tl]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        return sorted(hits, key=len, reverse=True)[0]
+    for r in valid_roles:
+        try:
+            if re.search(rf"\b{re.escape(r)}\b", t, flags=re.IGNORECASE):
+                return r
+        except re.error:
+            continue
+    return None
 
 
 # ---------- Visualization helpers ----------
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def viz_bar(run_dir: Path, title: str, labels: List[str], values: List[float], filename: str, y_title: str) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    fig = go.Figure(data=[go.Bar(x=labels, y=values)])
-    fig.update_layout(title=title, xaxis_title="Group", yaxis_title=y_title)
-    plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
-
-
-def viz_boxplot(run_dir: Path, title: str, groups: List[str], values_per_group: List[List[float]], filename: str, y_title: str) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    fig = go.Figure()
-    for grp, vals in zip(groups, values_per_group):
-        fig.add_trace(go.Box(y=vals, name=grp))
-    fig.update_layout(title=title, yaxis_title=y_title)
-    plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
 
 
 def viz_prompt_lengths(run_dir: Path, avg_stats: Dict[str, Dict[str, float]]) -> None:
@@ -142,24 +209,6 @@ def viz_prompt_lengths(run_dir: Path, avg_stats: Dict[str, Dict[str, float]]) ->
     fig.add_trace(go.Bar(name="baseline", x=metrics, y=bl))
     fig.update_layout(barmode="group", title="Average prompt sizes", yaxis_title="Count")
     plotly_offline_plot(fig, filename=str(run_dir / "prompt_lengths.html"), auto_open=False, include_plotlyjs="cdn")
-
-
-def viz_embedding_pca_per_game(run_dir: Path, entries: List[MemoryEntry], emb: np.ndarray) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    # group indices by game
-    by_game: Dict[str, List[int]] = defaultdict(list)
-    for i, e in enumerate(entries):
-        by_game[e.game_id].append(i)
-    pts = pca_2d(emb)
-    for gid, idxs in by_game.items():
-        x = pts[idxs, 0]
-        y = pts[idxs, 1]
-        texts = [f"{entries[i].entry_id}" for i in idxs]
-        colors = [entries[i].quest for i in idxs]
-        fig = go.Figure(data=[go.Scatter(x=x, y=y, mode="markers", marker=dict(color=colors, colorscale="Viridis", size=9), text=texts, hoverinfo="text")])
-        fig.update_layout(title=f"Embeddings PCA — {gid}")
-        plotly_offline_plot(fig, filename=str(run_dir / f"pca_{gid}.html"), auto_open=False, include_plotlyjs="cdn")
 
 
 def viz_confusion_matrix(
@@ -213,22 +262,7 @@ def viz_confusion_matrix(
     plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
 
 
-def viz_grouped_bars(
-    run_dir: Path,
-    title: str,
-    categories: List[str],
-    baseline_values: List[float],
-    current_values: List[float],
-    filename: str,
-    y_title: str,
-) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="baseline", x=categories, y=baseline_values))
-    fig.add_trace(go.Bar(name="current", x=categories, y=current_values))
-    fig.update_layout(barmode="group", title=title, xaxis_title="Category", yaxis_title=y_title)
-    plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
+    
 
 
 def avg_numbers(vals: List[float]) -> float:
@@ -249,32 +283,7 @@ def merge_avg_prompt_sizes(items: List[Dict[str, Dict[str, float]]]) -> Dict[str
 def average_aggregates(aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not aggs:
         return {}
-    # Simple numeric fields
-    avg_recall = avg_numbers([a.get("avg_recall_at_k", 0.0) for a in aggs])
-    avg_mrr = avg_numbers([a.get("avg_mrr", 0.0) for a in aggs])
     avg_prompt_sizes = merge_avg_prompt_sizes([a.get("avg_prompt_sizes", {}) for a in aggs])
-    # Merge by_role and by_quest with mean
-    roles = set()
-    quests = set()
-    for a in aggs:
-        roles |= set(a.get("by_role", {}).keys())
-        quests |= set(a.get("by_quest", {}).keys())
-    by_role = {}
-    for r in sorted(roles):
-        vals_r = [a.get("by_role", {}).get(r, {}) for a in aggs]
-        by_role[r] = {
-            "count": int(np.mean([v.get("count", 0) for v in vals_r])) if vals_r else 0,
-            "recall_at_k": avg_numbers([v.get("recall_at_k", 0.0) for v in vals_r]),
-            "mrr": avg_numbers([v.get("mrr", 0.0) for v in vals_r]),
-        }
-    by_quest = {}
-    for q in sorted(quests):
-        vals_q = [a.get("by_quest", {}).get(q, {}) for a in aggs]
-        by_quest[q] = {
-            "count": int(np.mean([v.get("count", 0) for v in vals_q])) if vals_q else 0,
-            "recall_at_k": avg_numbers([v.get("recall_at_k", 0.0) for v in vals_q]),
-            "mrr": avg_numbers([v.get("mrr", 0.0) for v in vals_q]),
-        }
     # Classification averages
     roles_clf = set()
     for a in aggs:
@@ -302,15 +311,9 @@ def average_aggregates(aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
     base = aggs[0]
     return {
         "k": base.get("k"),
-        "policy": base.get("policy"),
-        "alpha": base.get("alpha"),
         "memory_format": base.get("memory_format"),
         "model": base.get("model"),
-        "avg_recall_at_k": avg_recall,
-        "avg_mrr": avg_mrr,
         "avg_prompt_sizes": avg_prompt_sizes,
-        "by_role": by_role,
-        "by_quest": by_quest,
         "clf_by_role": clf_by_role,
         "clf_micro_f1": micro_f1,
         "clf_confusion": conf,
@@ -320,13 +323,12 @@ def average_aggregates(aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
 def evaluate_config(
     files: List[Path],
     k: int,
-    policy: str,
-    alpha: float,
     memory_format: str,
     model_name: str,
     use_llm: bool,
     openai_model: str,
     openai_api_key: str | None,
+    llm_use_baseline_prompt: bool,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
 
@@ -348,14 +350,10 @@ def evaluate_config(
     emb, model = build_embeddings(all_entries, model_name)
     index = build_faiss_ip_index(emb)
 
+    # Enumerate valid roles from dataset once (for parsing LLM output consistently)
+    valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
+
     results: List[Dict[str, Any]] = []
-    recalls_by_game: Dict[str, List[float]] = defaultdict(list)
-    mrr_by_game: Dict[str, List[float]] = defaultdict(list)
-    # Also track by proposer role and by quest number
-    recalls_by_role: Dict[str, List[float]] = defaultdict(list)
-    mrr_by_role: Dict[str, List[float]] = defaultdict(list)
-    recalls_by_quest: Dict[int, List[float]] = defaultdict(list)
-    mrr_by_quest: Dict[int, List[float]] = defaultdict(list)
     # Classification counters for proposer-role prediction via retrieval (top-1 label transfer)
     roles_seen: set[str] = set()
     tp: Dict[str, int] = defaultdict(int)
@@ -374,43 +372,47 @@ def evaluate_config(
         I = I[mask]
         D = D[mask]
 
-        # Re-rank if temporal policy
-        if policy == "temporal":
-            reranked = rerank_temporal(all_entries, I, D, target, alpha=float(alpha))
-            I2 = np.array([j for j, s in reranked], dtype=np.int64)
-            D2 = np.array([s for j, s in reranked], dtype=np.float32)
-        else:
-            I2, D2 = I, D
+        # Use nearest-neighbor scores directly for memory augmentation
+        I2, D2 = I, D
 
         # Top-k selection
         topk_idx = list(I2[: k])
         topk_scores = list(D2[: k])
 
-        # Metrics: define positives as same-game entries (excluding self)
-        same_game_indices = {i for i, e in enumerate(all_entries) if (e.game_id == target.game_id and i != qi)}
-        recall_k = 1.0 if any(j in same_game_indices for j in topk_idx) else 0.0
-        # MRR: rank of closest same-game item
-        rr = 0.0
-        pos = next((p for p, j in enumerate(I2) if int(j) in same_game_indices), None)
-        if pos is not None:
-            rr = 1.0 / float(pos + 1)
+        # Retrieval-only metrics removed in LLM-only mode
 
         # Prompts and stats
         retrieved_pairs = [(all_entries[j], float(s)) for j, s in zip(topk_idx, topk_scores)]
         prompt_mem = assemble_prompt(target, retrieved_pairs)
         prompt_base = assemble_baseline_prompt(target)
+        # Classification task with TypeChat-like output contract (strict JSON)
+        roles_list = ", ".join(valid_roles) if valid_roles else ""
+        task_suffix = "\n\nTask: Predict the role of the player who proposed the party."
+        if roles_list:
+            task_suffix += f" Valid roles: {roles_list}."
+        task_suffix += (
+            " Respond ONLY with a single-line JSON object matching this schema: "
+            "{\"role\": \"<ROLE>\"}. Do not include explanations, prefixes, or extra keys."
+        )
+        prompt_mem_task = prompt_mem + task_suffix
+        prompt_base_task = prompt_base + task_suffix
         pstats = prompt_stats(prompt_mem, prompt_base)
 
-        # Optional LLM call (stubbed)
-        llm_out = llm_role_predict(prompt_mem, bool(use_llm), openai_model, openai_api_key)
+        # Optional LLM call (uses augmented or baseline prompt depending on run mode)
+        llm_prompt = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
+        llm_out = llm_role_predict(llm_prompt, bool(use_llm), openai_model, openai_api_key)
 
-        # Heuristic proposer-role prediction: transfer top-1 retrieved proposer_role
+        # Proposer-role prediction (LLM or heuristic fallback)
         true_role = target.proposer_role
         pred_role = None
-        if len(I2) > 0:
-            cand_role = all_entries[int(I2[0])].proposer_role
-            if cand_role is not None:
-                pred_role = cand_role
+        if bool(use_llm):
+            pred_role = extract_role_label(llm_out.get("prediction"), valid_roles)
+        else:
+            # Fallback heuristic: transfer top-1 retrieved proposer_role
+            if len(I2) > 0:
+                cand_role = all_entries[int(I2[0])].proposer_role
+                if cand_role is not None:
+                    pred_role = cand_role
         if true_role is not None:
             roles_seen.add(true_role)
         if pred_role is not None:
@@ -430,30 +432,17 @@ def evaluate_config(
                 {"entry_id": all_entries[j].entry_id, "game_id": all_entries[j].game_id, "quest": int(all_entries[j].quest), "score": float(s)}
                 for j, s in zip(topk_idx, topk_scores)
             ],
-            "recall_at_k": recall_k,
-            "rr": rr,
-            "policy": policy,
-            "alpha": float(alpha) if policy == "temporal" else None,
             "memory_format": memory_format,
             "prompt_stats": pstats,
             "llm": llm_out,
             "classification": {
                 "true_role": true_role,
-                "pred_role_top1": pred_role,
+                "pred_role": pred_role,
             },
         }
         results.append(res)
-        recalls_by_game[target.game_id].append(recall_k)
-        mrr_by_game[target.game_id].append(rr)
-        role_key = (target.proposer_role or "unknown")
-        recalls_by_role[role_key].append(recall_k)
-        mrr_by_role[role_key].append(rr)
-        recalls_by_quest[int(target.quest)].append(recall_k)
-        mrr_by_quest[int(target.quest)].append(rr)
 
     # Aggregations
-    avg_recall = float(np.mean([r["recall_at_k"] for r in results])) if results else 0.0
-    avg_mrr = float(np.mean([r["rr"] for r in results])) if results else 0.0
     avg_prompt_sizes = {
         "with_memory": {
             "chars": float(np.mean([r["prompt_stats"]["with_memory"]["chars"] for r in results])) if results else 0.0,
@@ -465,24 +454,6 @@ def evaluate_config(
             "words": float(np.mean([r["prompt_stats"]["baseline"]["words"] for r in results])) if results else 0.0,
             "lines": float(np.mean([r["prompt_stats"]["baseline"]["lines"] for r in results])) if results else 0.0,
         },
-    }
-
-    # Summaries per category
-    by_role_summary = {
-        role: {
-            "count": int(len(vals)),
-            "recall_at_k": float(np.mean(vals)) if vals else 0.0,
-            "mrr": float(np.mean(mrr_by_role.get(role, []))) if mrr_by_role.get(role, []) else 0.0,
-        }
-        for role, vals in recalls_by_role.items()
-    }
-    by_quest_summary = {
-        int(q): {
-            "count": int(len(vals)),
-            "recall_at_k": float(np.mean(vals)) if vals else 0.0,
-            "mrr": float(np.mean(mrr_by_quest.get(int(q), []))) if mrr_by_quest.get(int(q), []) else 0.0,
-        }
-        for q, vals in recalls_by_quest.items()
     }
 
     # Classification metrics (per-role F1 and micro-F1)
@@ -508,18 +479,9 @@ def evaluate_config(
 
     agg = {
         "k": int(k),
-        "policy": policy,
-        "alpha": float(alpha) if policy == "temporal" else None,
         "memory_format": memory_format,
         "model": model_name,
-        "avg_recall_at_k": avg_recall,
-        "avg_mrr": avg_mrr,
         "avg_prompt_sizes": avg_prompt_sizes,
-        "games": {gid: {"recall_at_k": float(np.mean(recalls_by_game[gid])) if recalls_by_game[gid] else 0.0,
-                          "mrr": float(np.mean(mrr_by_game[gid])) if mrr_by_game[gid] else 0.0}
-                   for gid in recalls_by_game.keys()},
-        "by_role": by_role_summary,
-        "by_quest": by_quest_summary,
         "clf_by_role": clf_by_role,
         "clf_micro_f1": micro_f1,
         "clf_confusion": {tr: dict(prs) for tr, prs in conf_counts.items()},
@@ -533,13 +495,11 @@ def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Evaluate retrieval and prompting pipeline over an Avalon dataset.")
     ap.add_argument("--data_dir", type=str, default="dataset", help="Directory containing *.json games")
     ap.add_argument("--k", type=int, default=3, help="Top-k for retrieval and Recall@k")
-    ap.add_argument("--policy", type=str, default="nn", choices=["nn", "temporal"], help="Retrieval policy")
-    ap.add_argument("--alpha", type=float, default=0.5, help="Temporal decay alpha for 'temporal' policy")
     ap.add_argument("--memory_format", type=str, default="template", choices=["template", "template+summary"], help="Memory format for entries")
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer model name")
     ap.add_argument("--outdir", type=str, default="outputs/eval", help="Base output directory for saving results and visuals")
-    ap.add_argument("--llm", action="store_true", help="Call OpenAI LLM for downstream role prediction (stubbed by default)")
-    ap.add_argument("--openai-model", type=str, default="gpt-4o-mini", help="OpenAI model name (if --llm)")
+    ap.add_argument("--llm", action="store_true", help="Call an LLM for downstream role prediction (TypeChat-like JSON output enforced)")
+    ap.add_argument("--model", type=str, default="ollama:llama2:13b", help="LLM identifier. Use 'ollama:<model>' for local Ollama (e.g., 'ollama:llama3:8b-instruct') or 'openai:<model>' for OpenAI.")
     ap.add_argument("--openai-api-key", type=str, default=os.getenv("OPENAI_API_KEY"), help="OpenAI API Key (if --llm)")
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
@@ -559,7 +519,7 @@ def main(argv: List[str] | None = None) -> int:
         return 1
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_policy-{args.policy}_mem-{args.memory_format}"
+    run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_mem-{args.memory_format}_llm"
     ensure_dir(run_dir)
 
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
@@ -579,17 +539,16 @@ def main(argv: List[str] | None = None) -> int:
             pass
 
         # Baseline
-        print("  Evaluating baseline: policy=nn, memory_format=template")
+        print("  Evaluating baseline (no memory in prompt), memory_format=template")
         agg_base_i, res_base_i = evaluate_config(
             files=files,
             k=int(args.k),
-            policy="nn",
-            alpha=0.0,
             memory_format="template",
             model_name=args.model,
             use_llm=bool(args.llm),
-            openai_model=args.openai_model,
+            openai_model=args.model,
             openai_api_key=args.openai_api_key,
+            llm_use_baseline_prompt=True,
         )
         agg_base_runs.append(agg_base_i)
         with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -598,17 +557,16 @@ def main(argv: List[str] | None = None) -> int:
             json.dump(agg_base_i, f, ensure_ascii=False, indent=2)
 
         # Current
-        print(f"  Evaluating current: policy={args.policy}, memory_format={args.memory_format}")
+        print(f"  Evaluating current (with memory in prompt), memory_format={args.memory_format}")
         agg_cur_i, res_cur_i = evaluate_config(
             files=files,
             k=int(args.k),
-            policy=args.policy,
-            alpha=float(args.alpha),
             memory_format=args.memory_format,
             model_name=args.model,
             use_llm=bool(args.llm),
-            openai_model=args.openai_model,
+            openai_model=args.model,
             openai_api_key=args.openai_api_key,
+            llm_use_baseline_prompt=False,
         )
         agg_cur_runs.append(agg_cur_i)
         with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
@@ -658,36 +616,10 @@ def main(argv: List[str] | None = None) -> int:
                     for r in roles:
                         writer.writerow([i, "current", r, f"{a.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}"])
 
-    # Visualizations: per-role grouped bars, confusion matrices, and current prompt sizes
+    # Visualizations: confusion matrices and current prompt sizes
     viz_prompt_lengths(run_dir, agg_cur["avg_prompt_sizes"])  # focuses on current config’s prompts
 
-    # New: Per-role comparison (by proposer role)
-    roles = sorted(set(list(agg_base.get("by_role", {}).keys()) + list(agg_cur.get("by_role", {}).keys())))
-    if roles:
-        base_recall = [agg_base["by_role"].get(r, {}).get("recall_at_k", 0.0) for r in roles]
-        cur_recall = [agg_cur["by_role"].get(r, {}).get("recall_at_k", 0.0) for r in roles]
-        viz_grouped_bars(
-            run_dir,
-            title=f"Recall@{args.k} by proposer role",
-            categories=roles,
-            baseline_values=base_recall,
-            current_values=cur_recall,
-            filename="recall_by_role.html",
-            y_title=f"Recall@{args.k}",
-        )
-        base_mrr = [agg_base["by_role"].get(r, {}).get("mrr", 0.0) for r in roles]
-        cur_mrr = [agg_cur["by_role"].get(r, {}).get("mrr", 0.0) for r in roles]
-        viz_grouped_bars(
-            run_dir,
-            title="MRR by proposer role",
-            categories=roles,
-            baseline_values=base_mrr,
-            current_values=cur_mrr,
-            filename="mrr_by_role.html",
-            y_title="MRR",
-        )
-
-    # Note: Per-quest plots intentionally omitted per requirements.
+    # Note: Retrieval-only plots intentionally omitted in LLM-only mode.
 
     # New: Confusion matrices by role (averaged across runs)
     cm_roles = sorted(set(list(agg_base.get("clf_by_role", {}).keys()) + list(agg_cur.get("clf_by_role", {}).keys())))
@@ -713,8 +645,8 @@ def main(argv: List[str] | None = None) -> int:
 
     print(f"Saved evaluation to: {run_dir}")
     print(
-        f"Baseline (mean of {args.num_runs} runs): Recall@{args.k}={agg_base['avg_recall_at_k']:.3f}, MRR={agg_base['avg_mrr']:.3f} | "
-        f"Current (mean of {args.num_runs} runs): Recall@{args.k}={agg_cur['avg_recall_at_k']:.3f}, MRR={agg_cur['avg_mrr']:.3f}"
+        f"Baseline (mean of {args.num_runs} runs): micro-F1={agg_base.get('clf_micro_f1', 0.0):.3f} | "
+        f"Current (mean of {args.num_runs} runs): micro-F1={agg_cur.get('clf_micro_f1', 0.0):.3f}"
     )
     return 0
 
