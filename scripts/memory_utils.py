@@ -41,6 +41,9 @@ class MemoryEntry:
     quest: int
     text: str
     entry_id: str
+    # Optional metadata used for analysis/visualization
+    proposer: str | None = None
+    proposer_role: str | None = None
 
 
 # ---------- Data loading and memory formats ----------
@@ -75,6 +78,19 @@ def build_template_entry_for_quest(game: Dict, game_id: str, quest: int, msgs: L
     vote_outcome: str | None = None
     vote_result: str | None = None
     quest_result: str | None = None
+    proposer: str | None = None
+    proposer_role: str | None = None
+
+    # Build helper map from player name to role (if available)
+    name_to_role: Dict[str, str] = {}
+    try:
+        for u in (game.get("users", {}) or {}).values():
+            name = u.get("name")
+            role = u.get("role")
+            if name and role:
+                name_to_role[str(name)] = str(role)
+    except Exception:
+        pass
 
     for m in msgs:
         player = m.get("player", "")
@@ -84,6 +100,15 @@ def build_template_entry_for_quest(game: Dict, game_id: str, quest: int, msgs: L
             system_lines.append(msg)
             if "proposed a party:" in msg:
                 proposed_party = extract_party(msg)
+                # Try to parse proposer name before " proposed a party:"
+                try:
+                    # Expected format: "player-4 proposed a party: ..."
+                    proposer_token = msg.split(" proposed a party:", 1)[0].strip()
+                    proposer = proposer_token or proposer
+                    if proposer and proposer_role is None:
+                        proposer_role = name_to_role.get(proposer)
+                except Exception:
+                    pass
             if msg.startswith("party vote outcome:"):
                 vote_outcome = msg
             if msg.endswith("vote succeeded!") or msg.endswith("vote succeeded! initiating quest vote!"):
@@ -108,7 +133,14 @@ def build_template_entry_for_quest(game: Dict, game_id: str, quest: int, msgs: L
         "Transcript (player messages only):",
     ]
     text = "\n".join(header + transcript_lines)
-    return MemoryEntry(game_id=game_id, quest=int(quest), text=text, entry_id=f"{game_id}_q{quest}")
+    return MemoryEntry(
+        game_id=game_id,
+        quest=int(quest),
+        text=text,
+        entry_id=f"{game_id}_q{quest}",
+        proposer=proposer,
+        proposer_role=proposer_role,
+    )
 
 
 def heuristic_summary(text: str) -> str:
