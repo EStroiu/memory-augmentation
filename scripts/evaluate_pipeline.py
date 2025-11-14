@@ -333,7 +333,7 @@ def evaluate_config(
                 # 2) If still missing, attempt a one-shot TypeChat-style repair
                 if beliefs_obj is None:
                     schema_hint = '{"beliefs": {"player-1": "<ROLE>", "player-2": "<ROLE>", ...}}'
-                    repaired = _typechat_repair_to_json(raw_pred or "", schema_hint, openai_model, openai_api_key, True)
+                    repaired = typechat_repair_to_json(raw_pred or "", schema_hint, openai_model, openai_api_key, True)
                     repaired_container = extract_beliefs_object(repaired or "") if repaired else None
                     if isinstance(repaired_container, dict):
                         beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
@@ -357,7 +357,7 @@ def evaluate_config(
                 # If still no pred_role (repair may have produced role-only JSON), try role repair
                 if pred_role is None:
                     schema_hint_role = '{"role": "<ROLE>"}'
-                    repaired_role = _typechat_repair_to_json(raw_pred or "", schema_hint_role, openai_model, openai_api_key, True)
+                    repaired_role = typechat_repair_to_json(raw_pred or "", schema_hint_role, openai_model, openai_api_key, True)
                     pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
                     if pr2 is not None and pred_role is None:
                         processed_used_repair = True
