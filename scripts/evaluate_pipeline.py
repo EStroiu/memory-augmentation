@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import sys
@@ -79,13 +78,6 @@ except Exception:
     go = None  # type: ignore
     plotly_offline_plot = None  # type: ignore
 
-# HTTP client (optional; for Ollama integration)
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # type: ignore
-
-
 # Ensure repo root is importable when running as a script (python scripts/...) 
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -97,56 +89,20 @@ from scripts.memory_utils import (
     build_embeddings,
     build_faiss_ip_index,
     retrieve_top,
-    assemble_prompt,
-    assemble_baseline_prompt,
-    prompt_stats,
+)
+from scripts.llm_client import llm_role_predict
+from scripts.prompting import (
     assemble_prompt_budgeted,
     assemble_baseline_prompt_budgeted,
-    estimate_tokens,
+    prompt_stats,
 )
-
-
-def llm_role_predict(prompt: str, use_llm: bool, model_name: str, api_key: str | None) -> Dict[str, Any]:
-    """Call an LLM to get a raw prediction string.
-
-    Supported providers:
-    - Ollama (local): set model_name to "ollama:<model>" (e.g., "ollama:llama2:13b" or "ollama:llama2:13b-chat").
-      Uses OLLAMA_HOST env (default http://localhost:11434) and POSTs to /api/generate.
-    - OpenAI (stub): model_name starting with "openai:" will attempt to import openai but remains a no-op unless you extend it.
-
-    Returns a dict with keys: prediction (raw text), error (optional), provider.
-    """
-    if not use_llm:
-        return {"prediction": None, "cost": 0.0, "tokens": 0, "provider": None}
-
-    # Ollama provider
-    if model_name.lower().startswith("ollama:"):
-        if requests is None:
-            return {"prediction": None, "error": "requests not installed; pip install requests", "provider": "ollama"}
-        model = model_name.split(":", 1)[1]
-        base = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-        url = base.rstrip("/") + "/api/generate"
-        try:
-            resp = requests.post(url, json={"model": model, "prompt": prompt,  "stream": False}, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-            text = data.get("response") or data.get("message") or ""
-            return {"prediction": text, "provider": "ollama"}
-        except Exception as e:
-            return {"prediction": None, "error": f"ollama request failed: {e}", "provider": "ollama"}
-
-    # OpenAI (placeholder; extend if desired)
-    if model_name.lower().startswith("openai:"):
-        try:
-            import openai  # type: ignore
-        except Exception:
-            return {"prediction": None, "error": "openai library not installed", "provider": "openai"}
-        if not api_key:
-            return {"prediction": None, "error": "OPENAI_API_KEY not provided", "provider": "openai"}
-        # No-op placeholder: avoid making external calls by default
-        return {"prediction": None, "note": "openai path stubbed; implement as needed", "provider": "openai"}
-
-    return {"prediction": None, "error": "Unknown LLM provider; use model_name starting with 'ollama:' or 'openai:'"}
+from scripts.metrics_utils import (
+    avg_numbers,
+    merge_avg_prompt_sizes,
+    average_aggregates,
+    viz_prompt_lengths,
+    viz_confusion_matrix,
+)
 
 
 def _parse_json_role(text: str | None) -> str | None:
