@@ -24,8 +24,8 @@ def avg_numbers(vals: List[float]) -> float:
 
 def merge_avg_prompt_sizes(items: List[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
     out = {
-        "with_memory": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0},
-        "baseline": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0},
+        "with_memory": {"chars": 0.0, "words": 0.0, "lines": 0.0},
+        "baseline": {"chars": 0.0, "words": 0.0, "lines": 0.0},
     }
     if not items:
         return out
@@ -76,7 +76,7 @@ def average_aggregates(aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
 def viz_prompt_lengths(run_dir, avg_stats: Dict[str, Dict[str, float]]) -> None:
     if go is None or plotly_offline_plot is None:
         return
-    metrics = ["chars", "words", "lines", "tokens"]
+    metrics = ["chars", "words", "lines"]
     wm = [avg_stats["with_memory"].get(m, 0.0) for m in metrics]
     bl = [avg_stats["baseline"].get(m, 0.0) for m in metrics]
     fig = go.Figure()

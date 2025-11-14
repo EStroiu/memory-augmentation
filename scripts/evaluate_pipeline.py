@@ -1,43 +1,6 @@
 #!/usr/bin/env python3
 """
 Evaluate LLM performance with and without memory augmentation over an Avalon dataset.
-
-Run this script from the repository root (after installing requirements).
-Typical usage examples are in the top-level README.
-
-What this does now (LLM-only focus):
-- Builds a retrieval memory from all games (SentenceTransformers + FAISS NN) to select top-k context for each target round
-- Compares two prompts for the same target: baseline (no memory) vs memory-augmented
-- Calls an LLM (e.g., via Ollama) to predict the proposer role for each round
-- Enforces TypeChat-like structured output: prompts require a strict one-line JSON {"role": "<ROLE>"}; we parse and validate against allowed roles
-- Reports LLM classification metrics: per-role precision/recall/F1, micro-F1, and confusion matrices
-- Tracks prompt size stats (chars/words/lines) for baseline vs memory-augmented
-
-Removed (no longer reported):
-- Retrieval-only metrics (Recall@k, MRR) and their plots
-- Per-quest plots
-
-Usage (from repo root):
-    # Typical run using default embedding model (MiniLM) and an Ollama LLM
-    python scripts/evaluate_pipeline.py \
-        --data_dir avalon-nlu/dataset \
-        --k 3 \
-        --memory_format template \
-        --outdir outputs/eval \
-        --llm --llm_model ollama:llama2:13b
-
-    # If you want a different embedding model (SentenceTransformers) add:
-    #   --model sentence-transformers/all-mpnet-base-v2
-
-Incorrect (legacy) usage that caused errors:
-    # python scripts/evaluate_pipeline.py ... --llm --model ollama:llama2:13b
-    # (Now auto-corrected: the script will treat that as --llm_model and revert
-    #  --model to its default, emitting a warning.)
-
-Optional:
-    --memory_format template+summary
-    --llm --model ollama:llama3:8b-instruct   # any local Ollama model (set OLLAMA_HOST if not default)
-    --llm --model openai:gpt-4o-mini --openai-api-key $OPENAI_API_KEY  # OpenAI path is stubbed by default
 """
 from __future__ import annotations
 
@@ -89,76 +52,30 @@ from scripts.memory_utils import (
     build_embeddings,
     build_faiss_ip_index,
     retrieve_top,
+    messages_by_quest,
+    quest_state_line,
+    quest_transcript_only,
 )
 from scripts.llm_client import llm_role_predict
+from scripts.json_utils import (
+    extract_beliefs_object,
+    extract_role_label,
+    typechat_repair_to_json,
+)
 from scripts.prompting import (
-    assemble_prompt_budgeted,
-    assemble_baseline_prompt_budgeted,
+    assemble_prompt_with_meta,
+    assemble_baseline_prompt_with_meta,
+    assemble_belief_baseline_prompt,
     prompt_stats,
 )
-from scripts.metrics_utils import (
-    avg_numbers,
-    merge_avg_prompt_sizes,
-    average_aggregates,
-    viz_prompt_lengths,
-    viz_confusion_matrix,
-)
+from scripts.metrics_utils import average_aggregates, viz_prompt_lengths, viz_confusion_matrix
 
 
-def _parse_json_role(text: str | None) -> str | None:
-    """Try to parse a JSON object like {"role": "..."} from text."""
-    if not text:
-        return None
-    s = text.strip()
-    # first try direct JSON
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict) and isinstance(obj.get("role"), str):
-            return obj.get("role")
-    except Exception:
-        pass
-    # try to extract JSON substring
-    try:
-        m = re.search(r"\{[^{}]*\}", s, flags=re.DOTALL)
-        if m:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict) and isinstance(obj.get("role"), str):
-                return obj.get("role")
-    except Exception:
-        pass
-    return None
+def _parse_json_role(text: str | None) -> str | None:  # backward-compat alias
+    """Legacy wrapper kept for backward compatibility; delegates to json_utils."""
+    from scripts.json_utils import parse_json_role
 
-
-def extract_role_label(text: str | None, valid_roles: List[str]) -> str | None:
-    """Parse TypeChat-like JSON first, then fall back to fuzzy label extraction.
-
-    1) Parse JSON {"role": "<ROLE>"} and validate against valid_roles.
-    2) Fallback: contains/word-boundary matching.
-    """
-    # Step 1: JSON
-    role = _parse_json_role(text)
-    if role and valid_roles:
-        # map case-insensitively to a canonical valid role
-        for vr in valid_roles:
-            if role.strip().lower() == vr.lower():
-                return vr
-    # Step 2: fuzzy
-    if not text:
-        return None
-    t = text.strip()
-    tl = t.lower()
-    hits = [r for r in valid_roles if r.lower() in tl]
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        return sorted(hits, key=len, reverse=True)[0]
-    for r in valid_roles:
-        try:
-            if re.search(rf"\b{re.escape(r)}\b", t, flags=re.IGNORECASE):
-                return r
-        except re.error:
-            continue
-    return None
+    return parse_json_role(text)
 
 
 # ---------- Visualization helpers ----------
@@ -231,63 +148,6 @@ def viz_confusion_matrix(
     plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
 
 
-    
-
-
-def avg_numbers(vals: List[float]) -> float:
-    return float(np.mean(vals)) if vals else 0.0
-
-
-def merge_avg_prompt_sizes(items: List[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
-    out = {"with_memory": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0},
-           "baseline": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0}}
-    if not items:
-        return out
-    for key1 in out.keys():
-        for key2 in out[key1].keys():
-            out[key1][key2] = float(np.mean([x.get(key1, {}).get(key2, 0.0) for x in items]))
-    return out
-
-
-def average_aggregates(aggs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not aggs:
-        return {}
-    avg_prompt_sizes = merge_avg_prompt_sizes([a.get("avg_prompt_sizes", {}) for a in aggs])
-    # Classification averages
-    roles_clf = set()
-    for a in aggs:
-        roles_clf |= set(a.get("clf_by_role", {}).keys())
-    clf_by_role = {}
-    for r in sorted(roles_clf):
-        vals = [a.get("clf_by_role", {}).get(r, {}) for a in aggs]
-        clf_by_role[r] = {
-            "precision": avg_numbers([v.get("precision", 0.0) for v in vals]),
-            "recall": avg_numbers([v.get("recall", 0.0) for v in vals]),
-            "f1": avg_numbers([v.get("f1", 0.0) for v in vals]),
-        }
-    micro_f1 = avg_numbers([a.get("clf_micro_f1", 0.0) for a in aggs])
-
-    # Sum confusion matrices across runs (later normalize for plotting)
-    conf_roles = sorted(roles_clf)
-    conf: Dict[str, Dict[str, float]] = {tr: {pr: 0.0 for pr in conf_roles} for tr in conf_roles}
-    for a in aggs:
-        cm = a.get("clf_confusion", {}) or {}
-        for tr in conf_roles:
-            row = cm.get(tr, {}) or {}
-            for pr in conf_roles:
-                conf[tr][pr] += float(row.get(pr, 0))
-    # Model, policy, etc. just echo from first
-    base = aggs[0]
-    return {
-        "k": base.get("k"),
-        "memory_format": base.get("memory_format"),
-        "model": base.get("model"),
-        "avg_prompt_sizes": avg_prompt_sizes,
-        "clf_by_role": clf_by_role,
-        "clf_micro_f1": micro_f1,
-        "clf_confusion": conf,
-    }
-
 
 def evaluate_config(
     files: List[Path],
@@ -299,6 +159,7 @@ def evaluate_config(
     openai_api_key: str | None,
     llm_use_baseline_prompt: bool,
     max_prompt_tokens: int,
+    baseline_mode: str = "full_transcript",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
 
@@ -309,9 +170,20 @@ def evaluate_config(
     # Build entries across all games
     all_entries: List[MemoryEntry] = []
     per_game_indices: Dict[str, List[int]] = defaultdict(list)
+    # For belief baseline: cache game-level structures
+    games_raw: Dict[str, Dict] = {}
+    game_quests: Dict[str, Dict[int, List[Dict]]] = {}
+    game_players: Dict[str, List[str]] = {}
     for f in files:
         game = load_game_json(f)
         gid = f.stem
+        games_raw[gid] = game
+        quests = messages_by_quest(game)
+        game_quests[gid] = quests
+        # players list (stable order) from users map if available
+        users = (game.get("users", {}) or {})
+        players = [u.get("name") for u in users.values() if u.get("name")]
+        game_players[gid] = [str(p) for p in players]
         entries = build_memory_entries(game, gid, memory_format=memory_format)
         start_idx = len(all_entries)
         all_entries.extend(entries)
@@ -341,6 +213,10 @@ def evaluate_config(
     loop_start = time.time()
     total_entries = len(all_entries)
     last_report = 0.0
+
+    # For belief baseline: maintain per-game belief vectors as dict[player] -> role
+    belief_state_by_game: Dict[str, Dict[str, str]] = defaultdict(dict)
+
     for qi, target in enumerate(all_entries):
         q_vec = model.encode([target.text], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
         # Retrieve more than k for stability
@@ -363,7 +239,6 @@ def evaluate_config(
         # Prompts and stats
         retrieved_pairs = [(all_entries[j], float(s)) for j, s in zip(topk_idx, topk_scores)]
         # Classification task suffix (instructions + JSON schema requirement)
-        # Classification task with TypeChat-like output contract (strict JSON)
         roles_list = ", ".join(valid_roles) if valid_roles else ""
         task_suffix = "\n\nTask: Predict the role of the player who proposed the party."
         if roles_list:
@@ -372,20 +247,121 @@ def evaluate_config(
             " Respond ONLY with a single-line JSON object matching this schema: "
             "{\"role\": \"<ROLE>\"}. Do not include explanations, prefixes, or extra keys."
         )
-        # Build budgeted prompts (memory & baseline) regardless of which is used for call, to allow comparisons
-        prompt_mem_task, mem_meta = assemble_prompt_budgeted(target, retrieved_pairs, max_tokens=int(max_prompt_tokens), task_suffix=task_suffix)
-        prompt_base_task, base_meta = assemble_baseline_prompt_budgeted(target, max_tokens=int(max_prompt_tokens), task_suffix=task_suffix)
+
+        # Build prompts: memory-augmented is unchanged; baseline depends on baseline_mode
+        prompt_mem_task, mem_meta = assemble_prompt_with_meta(target, retrieved_pairs, task_suffix=task_suffix)
+
+        gid = target.game_id
+        # Default baseline: full transcript template (legacy behavior)
+        if baseline_mode == "full_transcript":
+            prompt_base_task, base_meta = assemble_baseline_prompt_with_meta(target, task_suffix=task_suffix)
+        else:
+            # belief_vector baseline: build compact state + belief prompt
+            quests = game_quests.get(gid, {})
+            players = game_players.get(gid, [])
+            # Ensure stable belief state dict for this game
+            beliefs = belief_state_by_game[gid]
+            for p in players:
+                beliefs.setdefault(p, "unknown")
+            # Past state lines for quests < current quest
+            past_state_lines: List[str] = []
+            for q in sorted(quests.keys()):
+                if int(q) >= int(target.quest):
+                    continue
+                past_state_lines.append(quest_state_line(gid, int(q), quests[q]))
+            current_msgs = quests.get(int(target.quest), [])
+            current_transcript = quest_transcript_only(current_msgs)
+            prompt_base_task = assemble_belief_baseline_prompt(
+                game_id=gid,
+                players=players,
+                belief_vector=beliefs,
+                past_state_lines=past_state_lines,
+                current_quest=int(target.quest),
+                current_transcript=current_transcript,
+                valid_roles=valid_roles,
+            )
+            base_meta = {"mode": "belief_vector"}
+
         pstats = prompt_stats(prompt_mem_task, prompt_base_task)
 
         # Optional LLM call (uses augmented or baseline prompt depending on run mode)
         llm_prompt = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
         llm_out = llm_role_predict(llm_prompt, bool(use_llm), openai_model, openai_api_key)
 
+        # Lightweight logging of LLM response and prompt length to monitor truncation/complaints
+        if bool(use_llm):
+            preview_raw = (llm_out.get("prediction") or "")
+            preview = preview_raw.replace("\n", " ")[:160]
+            err = llm_out.get("error") or llm_out.get("note")
+            warn = llm_out.get("warning") or llm_out.get("truncated")
+            # Clearer, aligned multi-line log for readability
+            print(
+                """
+    [llm]
+      game: {game}  quest: {quest}
+      prompt_chars: {pchars}
+      error: {error}
+      warning: {warning}
+      prediction_preview: {preview}
+                """.strip().format(
+                    game=gid,
+                    quest=target.quest,
+                    pchars=len(llm_prompt),
+                    error=repr(err),
+                    warning=repr(warn),
+                    preview=repr(preview),
+                )
+            )
+
         # Proposer-role prediction (LLM or heuristic fallback)
         true_role = target.proposer_role
         pred_role = None
+        # Debug info for processed output
+        processed_used_repair = False
+        processed_beliefs_preview: str | None = None
+        proposer_from_beliefs: str | None = None
         if bool(use_llm):
-            pred_role = extract_role_label(llm_out.get("prediction"), valid_roles)
+            raw_pred = llm_out.get("prediction")
+            pred_role = extract_role_label(raw_pred, valid_roles)
+            # If using belief baseline, parse/update beliefs robustly and derive proposer role
+            if baseline_mode == "belief_vector" and llm_use_baseline_prompt:
+                beliefs_obj: Dict[str, Any] | None = None
+                # 1) Try robust local extraction
+                beliefs_container = extract_beliefs_object(raw_pred or "")
+                if isinstance(beliefs_container, dict):
+                    beliefs_obj = beliefs_container.get("beliefs") if isinstance(beliefs_container.get("beliefs"), dict) else None
+                # 2) If still missing, attempt a one-shot TypeChat-style repair
+                if beliefs_obj is None:
+                    schema_hint = '{"beliefs": {"player-1": "<ROLE>", "player-2": "<ROLE>", ...}}'
+                    repaired = _typechat_repair_to_json(raw_pred or "", schema_hint, openai_model, openai_api_key, True)
+                    repaired_container = extract_beliefs_object(repaired or "") if repaired else None
+                    if isinstance(repaired_container, dict):
+                        beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
+                        processed_used_repair = True
+                # 3) Apply updates and set pred_role from proposer
+                if isinstance(beliefs_obj, dict):
+                    beliefs = belief_state_by_game[gid]
+                    for p, r in beliefs_obj.items():
+                        if isinstance(r, str):
+                            beliefs[str(p)] = r.strip()
+                    # Build a compact preview of the parsed beliefs JSON for debugging
+                    try:
+                        processed_beliefs_preview = json.dumps({"beliefs": beliefs_obj})[:160]
+                    except Exception:
+                        processed_beliefs_preview = None
+                    if isinstance(target.proposer, str):
+                        pr = beliefs.get(target.proposer)
+                        if isinstance(pr, str) and any(pr.lower() == vr.lower() for vr in valid_roles):
+                            pred_role = next(vr for vr in valid_roles if pr.lower() == vr.lower())
+                            proposer_from_beliefs = pred_role
+                # If still no pred_role (repair may have produced role-only JSON), try role repair
+                if pred_role is None:
+                    schema_hint_role = '{"role": "<ROLE>"}'
+                    repaired_role = _typechat_repair_to_json(raw_pred or "", schema_hint_role, openai_model, openai_api_key, True)
+                    pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
+                    if pr2 is not None and pred_role is None:
+                        processed_used_repair = True
+                    pred_role = pred_role or pr2
         else:
             # Fallback heuristic: transfer top-1 retrieved proposer_role
             if len(I2) > 0:
@@ -404,6 +380,28 @@ def evaluate_config(
                 fp[pred_role] += 1
                 fn[true_role] += 1
             conf_counts[true_role][pred_role] += 1
+
+        # Optional: print a processed view for debugging
+        if bool(use_llm):
+            print(
+                (
+                    """
+    [llm-processed]
+      game: {game}  quest: {quest}
+      role_parsed: {role}
+      proposer_from_beliefs: {proposer_role}
+      used_repair: {used_repair}
+      beliefs_preview: {beliefs_preview}
+                    """.strip()
+                ).format(
+                    game=gid,
+                    quest=target.quest,
+                    role=repr(pred_role),
+                    proposer_role=repr(proposer_from_beliefs),
+                    used_repair=repr(processed_used_repair),
+                    beliefs_preview=repr(processed_beliefs_preview),
+                )
+            )
 
         res = {
             "target": asdict(target),
@@ -439,13 +437,11 @@ def evaluate_config(
             "chars": float(np.mean([r["prompt_stats"]["with_memory"]["chars"] for r in results])) if results else 0.0,
             "words": float(np.mean([r["prompt_stats"]["with_memory"]["words"] for r in results])) if results else 0.0,
             "lines": float(np.mean([r["prompt_stats"]["with_memory"]["lines"] for r in results])) if results else 0.0,
-            "tokens": float(np.mean([r["prompt_stats"]["with_memory"]["tokens"] for r in results])) if results else 0.0,
         },
         "baseline": {
             "chars": float(np.mean([r["prompt_stats"]["baseline"]["chars"] for r in results])) if results else 0.0,
             "words": float(np.mean([r["prompt_stats"]["baseline"]["words"] for r in results])) if results else 0.0,
             "lines": float(np.mean([r["prompt_stats"]["baseline"]["lines"] for r in results])) if results else 0.0,
-            "tokens": float(np.mean([r["prompt_stats"]["baseline"]["tokens"] for r in results])) if results else 0.0,
         },
     }
 
@@ -499,7 +495,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
-    ap.add_argument("--max_prompt_tokens", type=int, default=4000, help="Maximum LLM prompt token budget (approx). Memory context will be adaptively compressed to fit.")
+    ap.add_argument("--max_prompt_tokens", type=int, default=4000, help="(Deprecated) No effect; prompts are assembled in full.")
+    ap.add_argument("--baseline_mode", type=str, default="full_transcript", choices=["full_transcript", "belief_vector"], help="Baseline prompting mode: full transcript per round or iterative belief-vector baseline.")
     args = ap.parse_args(argv)
 
     # Heuristic auto-correction: users sometimes pass the LLM model to --model.
@@ -587,6 +584,7 @@ def main(argv: List[str] | None = None) -> int:
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=True,
             max_prompt_tokens=int(args.max_prompt_tokens),
+            baseline_mode=str(args.baseline_mode),
         )
         agg_base_runs.append(agg_base_i)
         with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -606,6 +604,7 @@ def main(argv: List[str] | None = None) -> int:
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=False,
             max_prompt_tokens=int(args.max_prompt_tokens),
+            baseline_mode=str(args.baseline_mode),
         )
         agg_cur_runs.append(agg_cur_i)
         with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:

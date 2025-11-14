@@ -62,6 +62,47 @@ def messages_by_quest(game: Dict) -> Dict[int, List[Dict]]:
         grouped.setdefault(q, []).append(m)
     return grouped
 
+
+def quest_state_line(game_id: str, quest: int, msgs: List[Dict]) -> str:
+    """Build a compact state line for a given quest.
+
+    Follows the paper-style template: `quest-i: oi (party: pj | player votes: vj)`.
+    """
+    party_members: List[str] = []
+    votes: List[str] = []
+    outcome: str = "unknown"
+    for m in msgs:
+        player = m.get("player", "")
+        msg = m.get("msg", "")
+        if player == "system":
+            if "proposed a party:" in msg:
+                p = extract_party(msg)
+                if p:
+                    party_members = [s.strip() for s in p.split(",") if s.strip()]
+            if msg.startswith("party vote outcome:"):
+                # Raw system line already describes votes; keep compact suffix
+                votes.append(msg.replace("party vote outcome:", "").strip())
+            if msg.endswith("quest succeeded!"):
+                outcome = "success"
+            if msg.endswith("quest failed!"):
+                outcome = "fail"
+    party_str = ", ".join(party_members) if party_members else "unknown"
+    votes_str = "; ".join(votes) if votes else "unknown"
+    return f"quest-{quest}: {outcome} (party: {party_str} | player votes: {votes_str})"
+
+
+def quest_transcript_only(msgs: List[Dict]) -> str:
+    """Return only the player chat transcript for a quest (no system lines)."""
+    lines: List[str] = []
+    for m in msgs:
+        player = m.get("player", "")
+        if player == "system":
+            continue
+        msg = m.get("msg", "")
+        turn = m.get("turn", "?")
+        lines.append(f"[Turn {turn}] {player}: {msg}")
+    return "\n".join(lines)
+
 _party_re = re.compile(r"proposed a party:\s*(.*)$")
 
 def extract_party(line: str) -> str | None:
