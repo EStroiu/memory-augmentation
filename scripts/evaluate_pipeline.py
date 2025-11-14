@@ -18,12 +18,21 @@ Removed (no longer reported):
 - Per-quest plots
 
 Usage (from repo root):
-        python scripts/evaluate_pipeline.py \
+    # Typical run using default embedding model (MiniLM) and an Ollama LLM
+    python scripts/evaluate_pipeline.py \
         --data_dir avalon-nlu/dataset \
         --k 3 \
         --memory_format template \
         --outdir outputs/eval \
-    --llm --model ollama:llama2:13b
+        --llm --llm_model ollama:llama2:13b
+
+    # If you want a different embedding model (SentenceTransformers) add:
+    #   --model sentence-transformers/all-mpnet-base-v2
+
+Incorrect (legacy) usage that caused errors:
+    # python scripts/evaluate_pipeline.py ... --llm --model ollama:llama2:13b
+    # (Now auto-corrected: the script will treat that as --llm_model and revert
+    #  --model to its default, emitting a warning.)
 
 Optional:
     --memory_format template+summary
@@ -38,6 +47,7 @@ import math
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
@@ -90,6 +100,9 @@ from scripts.memory_utils import (
     assemble_prompt,
     assemble_baseline_prompt,
     prompt_stats,
+    assemble_prompt_budgeted,
+    assemble_baseline_prompt_budgeted,
+    estimate_tokens,
 )
 
 
@@ -114,7 +127,7 @@ def llm_role_predict(prompt: str, use_llm: bool, model_name: str, api_key: str |
         base = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         url = base.rstrip("/") + "/api/generate"
         try:
-            resp = requests.post(url, json={"model": model, "prompt": prompt, "stream": False}, timeout=120)
+            resp = requests.post(url, json={"model": model, "prompt": prompt,  "stream": False}, timeout=120)
             resp.raise_for_status()
             data = resp.json()
             text = data.get("response") or data.get("message") or ""
@@ -270,8 +283,8 @@ def avg_numbers(vals: List[float]) -> float:
 
 
 def merge_avg_prompt_sizes(items: List[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
-    out = {"with_memory": {"chars": 0.0, "words": 0.0, "lines": 0.0},
-           "baseline": {"chars": 0.0, "words": 0.0, "lines": 0.0}}
+    out = {"with_memory": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0},
+           "baseline": {"chars": 0.0, "words": 0.0, "lines": 0.0, "tokens": 0.0}}
     if not items:
         return out
     for key1 in out.keys():
@@ -329,12 +342,14 @@ def evaluate_config(
     openai_model: str,
     openai_api_key: str | None,
     llm_use_baseline_prompt: bool,
+    max_prompt_tokens: int,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
 
     Retrieval metrics exclude the query (self) from candidate results to avoid trivial rank=1.
     Positives are defined as entries from the same game as the query (excluding self).
     """
+    t0 = time.time()
     # Build entries across all games
     all_entries: List[MemoryEntry] = []
     per_game_indices: Dict[str, List[int]] = defaultdict(list)
@@ -345,10 +360,15 @@ def evaluate_config(
         start_idx = len(all_entries)
         all_entries.extend(entries)
         per_game_indices[gid].extend(list(range(start_idx, start_idx + len(entries))))
+    build_elapsed = time.time() - t0
+    print(f"    [progress] Built {len(all_entries)} entries (memory_format='{memory_format}') in {build_elapsed:.2f}s")
 
     # Embeddings and index
+    t1 = time.time()
     emb, model = build_embeddings(all_entries, model_name)
     index = build_faiss_ip_index(emb)
+    embed_elapsed = time.time() - t1
+    print(f"    [progress] Embeddings + index ready in {embed_elapsed:.2f}s (model='{model_name}')")
 
     # Enumerate valid roles from dataset once (for parsing LLM output consistently)
     valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
@@ -362,6 +382,9 @@ def evaluate_config(
     # Confusion matrix counts: true_role -> pred_role -> count
     conf_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
+    loop_start = time.time()
+    total_entries = len(all_entries)
+    last_report = 0.0
     for qi, target in enumerate(all_entries):
         q_vec = model.encode([target.text], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
         # Retrieve more than k for stability
@@ -383,8 +406,7 @@ def evaluate_config(
 
         # Prompts and stats
         retrieved_pairs = [(all_entries[j], float(s)) for j, s in zip(topk_idx, topk_scores)]
-        prompt_mem = assemble_prompt(target, retrieved_pairs)
-        prompt_base = assemble_baseline_prompt(target)
+        # Classification task suffix (instructions + JSON schema requirement)
         # Classification task with TypeChat-like output contract (strict JSON)
         roles_list = ", ".join(valid_roles) if valid_roles else ""
         task_suffix = "\n\nTask: Predict the role of the player who proposed the party."
@@ -394,9 +416,10 @@ def evaluate_config(
             " Respond ONLY with a single-line JSON object matching this schema: "
             "{\"role\": \"<ROLE>\"}. Do not include explanations, prefixes, or extra keys."
         )
-        prompt_mem_task = prompt_mem + task_suffix
-        prompt_base_task = prompt_base + task_suffix
-        pstats = prompt_stats(prompt_mem, prompt_base)
+        # Build budgeted prompts (memory & baseline) regardless of which is used for call, to allow comparisons
+        prompt_mem_task, mem_meta = assemble_prompt_budgeted(target, retrieved_pairs, max_tokens=int(max_prompt_tokens), task_suffix=task_suffix)
+        prompt_base_task, base_meta = assemble_baseline_prompt_budgeted(target, max_tokens=int(max_prompt_tokens), task_suffix=task_suffix)
+        pstats = prompt_stats(prompt_mem_task, prompt_base_task)
 
         # Optional LLM call (uses augmented or baseline prompt depending on run mode)
         llm_prompt = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
@@ -434,6 +457,7 @@ def evaluate_config(
             ],
             "memory_format": memory_format,
             "prompt_stats": pstats,
+            "prompt_meta": {"with_memory": mem_meta, "baseline": base_meta},
             "llm": llm_out,
             "classification": {
                 "true_role": true_role,
@@ -442,17 +466,30 @@ def evaluate_config(
         }
         results.append(res)
 
+        # Progress print every ~10% or each 100 entries
+        if total_entries > 0:
+            pct = (qi + 1) / total_entries * 100.0
+            if pct - last_report >= 10.0 or (qi + 1) % 100 == 0 or (qi + 1) == total_entries:
+                last_report = pct
+                elapsed_loop = time.time() - loop_start
+                avg_per = elapsed_loop / (qi + 1)
+                est_total = avg_per * total_entries
+                remaining = est_total - elapsed_loop
+                print(f"    [progress] {qi+1}/{total_entries} ({pct:4.1f}%) entries; avg {avg_per:.2f}s/entry; ETA {remaining:.1f}s")
+
     # Aggregations
     avg_prompt_sizes = {
         "with_memory": {
             "chars": float(np.mean([r["prompt_stats"]["with_memory"]["chars"] for r in results])) if results else 0.0,
             "words": float(np.mean([r["prompt_stats"]["with_memory"]["words"] for r in results])) if results else 0.0,
             "lines": float(np.mean([r["prompt_stats"]["with_memory"]["lines"] for r in results])) if results else 0.0,
+            "tokens": float(np.mean([r["prompt_stats"]["with_memory"]["tokens"] for r in results])) if results else 0.0,
         },
         "baseline": {
             "chars": float(np.mean([r["prompt_stats"]["baseline"]["chars"] for r in results])) if results else 0.0,
             "words": float(np.mean([r["prompt_stats"]["baseline"]["words"] for r in results])) if results else 0.0,
             "lines": float(np.mean([r["prompt_stats"]["baseline"]["lines"] for r in results])) if results else 0.0,
+            "tokens": float(np.mean([r["prompt_stats"]["baseline"]["tokens"] for r in results])) if results else 0.0,
         },
     }
 
@@ -477,6 +514,8 @@ def evaluate_config(
     micro_rec = (tp_sum / (tp_sum + fn_sum)) if (tp_sum + fn_sum) > 0 else 0.0
     micro_f1 = (2 * micro_prec * micro_rec / (micro_prec + micro_rec)) if (micro_prec + micro_rec) > 0 else 0.0
 
+    total_elapsed = time.time() - t0
+    print(f"    [done] memory_format='{memory_format}' finished in {total_elapsed:.2f}s")
     agg = {
         "k": int(k),
         "memory_format": memory_format,
@@ -496,15 +535,34 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--data_dir", type=str, default="dataset", help="Directory containing *.json games")
     ap.add_argument("--k", type=int, default=3, help="Top-k for retrieval and Recall@k")
     ap.add_argument("--memory_format", type=str, default="template", choices=["template", "template+summary"], help="Memory format for entries")
-    ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer model name")
+    ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer embedding model name")
     ap.add_argument("--outdir", type=str, default="outputs/eval", help="Base output directory for saving results and visuals")
     ap.add_argument("--llm", action="store_true", help="Call an LLM for downstream role prediction (TypeChat-like JSON output enforced)")
-    ap.add_argument("--model", type=str, default="ollama:llama2:13b", help="LLM identifier. Use 'ollama:<model>' for local Ollama (e.g., 'ollama:llama3:8b-instruct') or 'openai:<model>' for OpenAI.")
+    ap.add_argument("--llm_model", type=str, default="ollama:llama2:13b", help="LLM identifier. Use 'ollama:<model>' (e.g., 'ollama:llama3:8b-instruct') or 'openai:<model>' for OpenAI.")
     ap.add_argument("--openai-api-key", type=str, default=os.getenv("OPENAI_API_KEY"), help="OpenAI API Key (if --llm)")
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
+    ap.add_argument("--max_prompt_tokens", type=int, default=4000, help="Maximum LLM prompt token budget (approx). Memory context will be adaptively compressed to fit.")
     args = ap.parse_args(argv)
+
+    # Heuristic auto-correction: users sometimes pass the LLM model to --model.
+    # If --model looks like an LLM identifier and --llm_model is still default, swap them.
+    try:
+        default_llm_model = ap.get_default("llm_model")
+        default_embed_model = ap.get_default("model")
+        if args.llm and isinstance(args.model, str) and args.model.lower().startswith(("ollama:", "openai:")):
+            # Only swap if user did not explicitly set --llm_model different from default.
+            if args.llm_model == default_llm_model:
+                print(
+                    f"[warn] Detected LLM id '{args.model}' passed to --model. "
+                    f"Treating it as --llm_model and restoring embedding model to '{default_embed_model}'.",
+                    file=sys.stderr,
+                )
+                args.llm_model = args.model
+                args.model = default_embed_model
+    except Exception:
+        pass
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
@@ -518,7 +576,30 @@ def main(argv: List[str] | None = None) -> int:
         print(f"No JSON games in {data_dir}", file=sys.stderr)
         return 1
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Pre-run workload estimation (entries per memory format, projected LLM calls & duration)
+    try:
+        baseline_entries_count = 0
+        current_entries_count = 0
+        for f in files:
+            game_obj = load_game_json(f)
+            baseline_entries_count += len(build_memory_entries(game_obj, f.stem, memory_format="template"))
+            current_entries_count += len(build_memory_entries(game_obj, f.stem, memory_format=args.memory_format))
+        total_llm_calls_per_run = (baseline_entries_count + current_entries_count) if args.llm else 0
+        total_llm_calls_all = total_llm_calls_per_run * int(args.num_runs)
+        avg_latency = float(os.getenv("LLM_AVG_LATENCY_SEC", "2.5")) if args.llm else 0.0
+        est_minutes = (total_llm_calls_all * avg_latency) / 60.0 if avg_latency > 0 else 0.0
+        print(f"[info] Loaded {len(files)} game files from '{data_dir}'.")
+        print(f"[info] Baseline entries (template): {baseline_entries_count}")
+        print(f"[info] Current entries ({args.memory_format}): {current_entries_count}")
+        if args.llm:
+            print(f"[info] Planned runs: {args.num_runs}; LLM calls/run: {total_llm_calls_per_run}; total: {total_llm_calls_all}")
+            print(f"[estimate] Avg latency ~{avg_latency:.1f}s -> est prompting time ~{est_minutes:.1f} min (override with LLM_AVG_LATENCY_SEC)")
+        else:
+            print("[info] LLM disabled; using retrieval heuristic for role prediction.")
+    except Exception as e:
+        print(f"[warn] Pre-run estimation unavailable: {e}")
+
+    ts = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
     run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_mem-{args.memory_format}_llm"
     ensure_dir(run_dir)
 
@@ -546,9 +627,10 @@ def main(argv: List[str] | None = None) -> int:
             memory_format="template",
             model_name=args.model,
             use_llm=bool(args.llm),
-            openai_model=args.model,
+            openai_model=args.llm_model,
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=True,
+            max_prompt_tokens=int(args.max_prompt_tokens),
         )
         agg_base_runs.append(agg_base_i)
         with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -564,9 +646,10 @@ def main(argv: List[str] | None = None) -> int:
             memory_format=args.memory_format,
             model_name=args.model,
             use_llm=bool(args.llm),
-            openai_model=args.model,
+            openai_model=args.llm_model,
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=False,
+            max_prompt_tokens=int(args.max_prompt_tokens),
         )
         agg_cur_runs.append(agg_cur_i)
         with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
