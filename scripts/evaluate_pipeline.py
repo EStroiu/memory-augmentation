@@ -158,7 +158,6 @@ def evaluate_config(
     openai_model: str,
     openai_api_key: str | None,
     llm_use_baseline_prompt: bool,
-    max_prompt_tokens: int,
     baseline_mode: str = "full_transcript",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
@@ -495,7 +494,6 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
-    ap.add_argument("--max_prompt_tokens", type=int, default=4000, help="(Deprecated) No effect; prompts are assembled in full.")
     ap.add_argument("--baseline_mode", type=str, default="full_transcript", choices=["full_transcript", "belief_vector"], help="Baseline prompting mode: full transcript per round or iterative belief-vector baseline.")
     args = ap.parse_args(argv)
 
@@ -583,7 +581,6 @@ def main(argv: List[str] | None = None) -> int:
             openai_model=args.llm_model,
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=True,
-            max_prompt_tokens=int(args.max_prompt_tokens),
             baseline_mode=str(args.baseline_mode),
         )
         agg_base_runs.append(agg_base_i)
@@ -603,7 +600,6 @@ def main(argv: List[str] | None = None) -> int:
             openai_model=args.llm_model,
             openai_api_key=args.openai_api_key,
             llm_use_baseline_prompt=False,
-            max_prompt_tokens=int(args.max_prompt_tokens),
             baseline_mode=str(args.baseline_mode),
         )
         agg_cur_runs.append(agg_cur_i)
