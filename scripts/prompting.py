@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""Prompt assembly, budgeting, and stats utilities.
-
-This module centralizes prompt-related logic so that memory construction and
-retrieval stay in `memory_utils.py` and evaluation scripts can stay compact.
-"""
 from __future__ import annotations
-
 import re
 from typing import Any, Dict, List, Tuple
-
 from scripts.memory_utils import MemoryEntry, heuristic_summary
 
-
 # ---------- Basic prompt assembly ----------
-
 
 def assemble_prompt(target: MemoryEntry, retrieved: List[Tuple[MemoryEntry, float]]) -> str:
     parts: List[str] = []

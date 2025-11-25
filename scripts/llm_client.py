@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""Lightweight LLM client wrappers used by evaluation scripts.
-
-Currently supports:
-- Ollama via HTTP API (local models)
-- OpenAI (stubbed; extend as needed)
-"""
 from __future__ import annotations
-
 import json
 import os
 from typing import Any, Dict, Optional
-
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    requests = None  # type: ignore
+import requests
 
 
 def llm_role_predict(prompt: str, use_llm: bool, model_name: str, api_key: Optional[str] = None) -> Dict[str, Any]:

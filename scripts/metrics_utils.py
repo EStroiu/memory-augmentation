@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
-"""Metrics aggregation and visualization helpers for Avalon evaluations."""
 from __future__ import annotations
-
 from typing import Any, Dict, List
-
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover - required by caller anyway
-    raise
-
-# Plotly optional
-try:
-    import plotly.graph_objects as go  # type: ignore
-    from plotly.offline import plot as plotly_offline_plot  # type: ignore
-except Exception:  # pragma: no cover - optional
-    go = None  # type: ignore
-    plotly_offline_plot = None  # type: ignore
+import numpy as np
+import plotly.graph_objects as go  # type: ignore
+from plotly.offline import plot as plotly_offline_plot
 
 
 def avg_numbers(vals: List[float]) -> float:

@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-Shared utilities for building Avalon memory entries, embeddings, retrieval, and prompt assembly.
-
-This module is imported by the command-line scripts under `scripts/`. You typically won't run
-this directly; instead, use:
-
-- `python scripts/build_memory_index.py` for a single-game probe
-- `python scripts/evaluate_pipeline.py` to evaluate over the full dataset
-"""
 from __future__ import annotations
-
 import json
 import math
 import re
@@ -17,23 +7,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
-
-try:
-    import numpy as np
-except ImportError:
-    raise
-
-# ML deps (lazy handled)
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None  # type: ignore
-
-try:
-    import faiss  # type: ignore
-except Exception:
-    faiss = None  # type: ignore
-
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
 
 @dataclass
 class MemoryEntry:
@@ -41,7 +17,6 @@ class MemoryEntry:
     quest: int
     text: str
     entry_id: str
-    # Optional metadata used for analysis/visualization
     proposer: str | None = None
     proposer_role: str | None = None
 

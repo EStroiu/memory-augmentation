@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Evaluate LLM performance with and without memory augmentation over an Avalon dataset.
-"""
 from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -15,36 +11,12 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
-
-try:
-    import numpy as np
-except ImportError:
-    print("numpy required. pip install -r requirements.txt", file=sys.stderr)
-    raise
-
-# ML deps (lazy handled)
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None  # type: ignore
-
-try:
-    import faiss  # type: ignore
-except Exception:
-    faiss = None  # type: ignore
-
-# Plotly optional
-try:
-    import plotly.graph_objects as go  # type: ignore
-    from plotly.offline import plot as plotly_offline_plot  # type: ignore
-except Exception:
-    go = None  # type: ignore
-    plotly_offline_plot = None  # type: ignore
-
-# Ensure repo root is importable when running as a script (python scripts/...) 
-if str(Path(__file__).resolve().parents[1]) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import plotly.graph_objects as go
+from plotly.offline import plot as plotly_offline_plot
+from scripts.metrics_utils import average_aggregates, viz_prompt_lengths, viz_confusion_matrix
 from scripts.memory_utils import (
     MemoryEntry,
     load_game_json,
@@ -68,15 +40,10 @@ from scripts.prompting import (
     assemble_belief_baseline_prompt,
     prompt_stats,
 )
-from scripts.metrics_utils import average_aggregates, viz_prompt_lengths, viz_confusion_matrix
 
-
-def _parse_json_role(text: str | None) -> str | None:  # backward-compat alias
-    """Legacy wrapper kept for backward compatibility; delegates to json_utils."""
-    from scripts.json_utils import parse_json_role
-
-    return parse_json_role(text)
-
+# Ensure repo root is importable when running as a script (python scripts/...) 
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # ---------- Visualization helpers ----------
 

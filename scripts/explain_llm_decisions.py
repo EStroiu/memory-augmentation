@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
 import argparse
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
-
-try:
-    import numpy as np
-except Exception:
-    np = None
-
-try:
-    import plotly.graph_objects as go 
-    from plotly.offline import plot as plotly_offline_plot
-except Exception:
-    go = None 
-    plotly_offline_plot = None
-
+import numpy as np
+import plotly.graph_objects as go 
+from plotly.offline import plot as plotly_offline_plot
 
 @dataclass
 class ClassifiedExample:
