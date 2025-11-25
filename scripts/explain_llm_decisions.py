@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import numpy as np
-import plotly.graph_objects as go 
-from plotly.offline import plot as plotly_offline_plot
+from scripts.metrics_utils import viz_confusion_matrix
 
 @dataclass
 class ClassifiedExample:
@@ -115,36 +114,24 @@ def print_examples(examples: List[ClassifiedExample]) -> None:
 
 
 def viz_confusion_heatmap(counts: Dict[Tuple[str, str], int], out_html: Path) -> None:
-    """Create a simple confusion heatmap using Plotly (if available)."""
-    if go is None or plotly_offline_plot is None:
-        print("Plotly not available; skipping heatmap.")
-        return
+    """Create a confusion heatmap using the shared metrics_utils helper."""
     roles = sorted({tr for tr, _ in counts.keys()} | {pr for _, pr in counts.keys()})
     if not roles:
         print("No roles to visualize.")
         return
     n = len(roles)
     idx = {r: i for i, r in enumerate(roles)}
-    import numpy as np  # local import guarded by outer try
-
     M = np.zeros((n, n), dtype=float)
     for (tr, pr), c in counts.items():
         if tr not in idx or pr not in idx:
             continue
         M[idx[tr], idx[pr]] += c
-    row_sums = M.sum(axis=1, keepdims=True)
-    norm = np.divide(M, np.where(row_sums == 0, 1.0, row_sums), where=(row_sums != 0))
-    fig = go.Figure(data=go.Heatmap(
-        z=norm,
-        x=roles,
-        y=roles,
-        colorscale="Blues",
-        zmin=0.0,
-        zmax=1.0,
-        colorbar=dict(title="Row-normalized"),
-    ))
-    fig.update_layout(title="LLM confusion heatmap (true vs predicted)", xaxis_title="Predicted role", yaxis_title="True role")
-    plotly_offline_plot(fig, filename=str(out_html), auto_open=False, include_plotlyjs="cdn")
+    # Convert back to the dict[true][pred] shape expected by viz_confusion_matrix
+    confusion: Dict[str, Dict[str, float]] = {tr: {pr: 0.0 for pr in roles} for tr in roles}
+    for i, tr in enumerate(roles):
+        for j, pr in enumerate(roles):
+            confusion[tr][pr] = float(M[i, j])
+    viz_confusion_matrix(out_html.parent, "LLM confusion heatmap (true vs predicted)", roles, confusion, None, out_html.name)
     print(f"Saved confusion heatmap to: {out_html}")
 
 

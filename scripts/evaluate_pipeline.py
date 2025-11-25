@@ -7,17 +7,17 @@ import re
 import sys
 import time
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional, Protocol, Callable
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
 import plotly.graph_objects as go
 from plotly.offline import plot as plotly_offline_plot
 from scripts.metrics_utils import average_aggregates, viz_prompt_lengths, viz_confusion_matrix
-from scripts.memory_utils import (
+from scripts.template_summary import (
     MemoryEntry,
     load_game_json,
     build_memory_entries,
@@ -41,79 +41,273 @@ from scripts.prompting import (
     prompt_stats,
 )
 
-# Ensure repo root is importable when running as a script (python scripts/...) 
+# Ensure repo root is importable when running as a script (python scripts/...)
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# ---------- Visualization helpers ----------
+
+@dataclass
+class ExperimentConfig:
+    """High-level configuration for a single experiment run.
+
+    This can be used both from the CLI and from notebooks/other Python code
+    to launch experiments with a single function call.
+    """
+
+    data_dir: Path
+    outdir: Path = Path("outputs/eval")
+    k: int = 3
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    use_llm: bool = False
+    llm_model: str = "ollama:llama2:13b"
+    openai_api_key: Optional[str] = None
+    max_games: Optional[int] = None
+    num_runs: int = 1
+    seed: int = 42
+
+    # Prompt strategies (registered in PROMPT_REGISTRY)
+    baseline_prompt: str = "baseline_full_transcript"  # or "belief_vector", "none"
+    current_prompt: str = "mem_template"               # or "mem_template+summary", ...
+    run_baseline: bool = True
+    run_current: bool = True
+
+    # LLM post-processing (registered in LLM_POST_REGISTRY)
+    llm_fixer: str = "none"  # e.g. "none", "typechat_role", "typechat_beliefs"
+
+    # Human-readable name for output folder naming
+    experiment_name: str = "custom"
+
+
+class PromptStrategy(Protocol):
+    def __call__(
+        self,
+        target: MemoryEntry,
+        retrieved: List[Tuple[MemoryEntry, float]],
+        ctx: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        ...
+
+
+class LLMPostProcessor(Protocol):
+    def __call__(
+        self,
+        raw_pred: Optional[str],
+        valid_roles: List[str],
+        ctx: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        ...
+
+
+PROMPT_REGISTRY: Dict[str, PromptStrategy] = {}
+LLM_POST_REGISTRY: Dict[str, LLMPostProcessor] = {}
+
+
+def register_prompt(name: str) -> Callable[[PromptStrategy], PromptStrategy]:
+    def _wrap(fn: PromptStrategy) -> PromptStrategy:
+        PROMPT_REGISTRY[name] = fn
+        return fn
+
+    return _wrap
+
+
+def register_llm_post(name: str) -> Callable[[LLMPostProcessor], LLMPostProcessor]:
+    def _wrap(fn: LLMPostProcessor) -> LLMPostProcessor:
+        LLM_POST_REGISTRY[name] = fn
+        return fn
+
+    return _wrap
+
+
+@register_prompt("baseline_full_transcript")
+def prompt_baseline_full_transcript(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    task_suffix: str = ctx.get("task_suffix", "")
+    prompt, meta = assemble_baseline_prompt_with_meta(target, task_suffix=task_suffix)
+    meta["mode"] = "full_transcript"
+    return prompt, meta
+
+
+@register_prompt("belief_vector")
+def prompt_belief_vector(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Belief-vector baseline prompt using cached game structures in ctx."""
+
+    game_id: str = target.game_id
+    quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
+    players: List[str] = ctx["game_players"].get(game_id, [])
+    belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
+    valid_roles: List[str] = ctx["valid_roles"]
+
+    # Ensure stable belief state dict for this game
+    beliefs = belief_state_by_game[game_id]
+    for p in players:
+        beliefs.setdefault(p, "unknown")
+
+    # Past state lines for quests < current quest
+    past_state_lines: List[str] = []
+    for q in sorted(quests.keys()):
+        if int(q) >= int(target.quest):
+            continue
+        past_state_lines.append(quest_state_line(game_id, int(q), quests[q]))
+    current_msgs = quests.get(int(target.quest), [])
+    current_transcript = quest_transcript_only(current_msgs)
+
+    prompt = assemble_belief_baseline_prompt(
+        game_id=game_id,
+        players=players,
+        belief_vector=beliefs,
+        past_state_lines=past_state_lines,
+        current_quest=int(target.quest),
+        current_transcript=current_transcript,
+        valid_roles=valid_roles,
+    )
+    meta: Dict[str, Any] = {"mode": "belief_vector"}
+    return prompt, meta
+
+
+@register_prompt("mem_template")
+def prompt_mem_template(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    task_suffix: str = ctx.get("task_suffix", "")
+    return assemble_prompt_with_meta(target, retrieved, task_suffix=task_suffix)
+
+
+@register_prompt("mem_template+summary")
+def prompt_mem_template_summary(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Prompt strategy for template+summary memory format.
+
+    This assumes entries were built with memory_format="template+summary", which
+    appends a heuristic summary to each template entry in template_summary.
+    """
+    task_suffix: str = ctx.get("task_suffix", "")
+    return assemble_prompt_with_meta(target, retrieved, task_suffix=task_suffix)
+
+
+@register_llm_post("none")
+def llm_post_none(
+    raw_pred: Optional[str],
+    valid_roles: List[str],
+    ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """No repair: just parse JSON/labels locally."""
+
+    pred_role = extract_role_label(raw_pred, valid_roles)
+    return {
+        "pred_role": pred_role,
+        "beliefs_obj": None,
+        "used_repair": False,
+        "proposer_from_beliefs": None,
+        "beliefs_preview": None,
+    }
+
+
+@register_llm_post("typechat_role")
+def llm_post_typechat_role(
+    raw_pred: Optional[str],
+    valid_roles: List[str],
+    ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """TypeChat-style repair for role-only JSON."""
+
+    openai_model: str = ctx.get("openai_model", "")
+    openai_api_key: Optional[str] = ctx.get("openai_api_key")
+    base_role = extract_role_label(raw_pred, valid_roles)
+    used_repair = False
+    if base_role is None and raw_pred:
+        schema_hint_role = '{"role": "<ROLE>"}'
+        repaired_role = typechat_repair_to_json(raw_pred, schema_hint_role, openai_model, openai_api_key, True)
+        repaired_parsed = extract_role_label(repaired_role, valid_roles) if repaired_role else None
+        if repaired_parsed is not None:
+            base_role = repaired_parsed
+            used_repair = True
+    return {
+        "pred_role": base_role,
+        "beliefs_obj": None,
+        "used_repair": used_repair,
+        "proposer_from_beliefs": None,
+        "beliefs_preview": None,
+    }
+
+
+@register_llm_post("typechat_beliefs")
+def llm_post_typechat_beliefs(
+    raw_pred: Optional[str],
+    valid_roles: List[str],
+    ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Belief-vector style repair: parse/update beliefs and derive proposer role."""
+
+    openai_model: str = ctx.get("openai_model", "")
+    openai_api_key: Optional[str] = ctx.get("openai_api_key")
+    target: MemoryEntry = ctx["target"]
+    belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
+
+    beliefs_obj: Dict[str, Any] | None = None
+    used_repair = False
+    beliefs_preview: Optional[str] = None
+    proposer_from_beliefs: Optional[str] = None
+
+    text = raw_pred or ""
+    beliefs_container = extract_beliefs_object(text)
+    if isinstance(beliefs_container, dict):
+        beliefs_obj = beliefs_container.get("beliefs") if isinstance(beliefs_container.get("beliefs"), dict) else None
+    if beliefs_obj is None and text:
+        schema_hint = '{"beliefs": {"player-1": "<ROLE>", "player-2": "<ROLE>", ...}}'
+        repaired = typechat_repair_to_json(text, schema_hint, openai_model, openai_api_key, True)
+        repaired_container = extract_beliefs_object(repaired or "") if repaired else None
+        if isinstance(repaired_container, dict):
+            beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
+            used_repair = beliefs_obj is not None
+
+    pred_role = extract_role_label(raw_pred, valid_roles)
+    if isinstance(beliefs_obj, dict):
+        beliefs = belief_state_by_game[target.game_id]
+        for p, r in beliefs_obj.items():
+            if isinstance(r, str):
+                beliefs[str(p)] = r.strip()
+        try:
+            beliefs_preview = json.dumps({"beliefs": beliefs_obj})[:160]
+        except Exception:
+            beliefs_preview = None
+        if isinstance(target.proposer, str):
+            pr = beliefs.get(target.proposer)
+            if isinstance(pr, str) and any(pr.lower() == vr.lower() for vr in valid_roles):
+                pred_role = next(vr for vr in valid_roles if pr.lower() == vr.lower())
+                proposer_from_beliefs = pred_role
+
+    # If still no pred_role, fallback to role repair
+    if pred_role is None and text:
+        schema_hint_role = '{"role": "<ROLE>"}'
+        repaired_role = typechat_repair_to_json(text, schema_hint_role, openai_model, openai_api_key, True)
+        pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
+        if pr2 is not None and pred_role is None:
+            used_repair = True
+        pred_role = pred_role or pr2
+
+    return {
+        "pred_role": pred_role,
+        "beliefs_obj": beliefs_obj,
+        "used_repair": used_repair,
+        "proposer_from_beliefs": proposer_from_beliefs,
+        "beliefs_preview": beliefs_preview,
+    }
+
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def viz_prompt_lengths(run_dir: Path, avg_stats: Dict[str, Dict[str, float]]) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    metrics = ["chars", "words", "lines"]
-    wm = [avg_stats["with_memory"][m] for m in metrics]
-    bl = [avg_stats["baseline"][m] for m in metrics]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="with_memory", x=metrics, y=wm))
-    fig.add_trace(go.Bar(name="baseline", x=metrics, y=bl))
-    fig.update_layout(barmode="group", title="Average prompt sizes", yaxis_title="Count")
-    plotly_offline_plot(fig, filename=str(run_dir / "prompt_lengths.html"), auto_open=False, include_plotlyjs="cdn")
-
-
-def viz_confusion_matrix(
-    run_dir: Path,
-    title: str,
-    roles: List[str],
-    confusion: Dict[str, Dict[str, float]],
-    f1_by_role: Dict[str, float] | None,
-    filename: str,
-) -> None:
-    if go is None or plotly_offline_plot is None:
-        return
-    n = len(roles)
-    # Build count matrix
-    M = np.zeros((n, n), dtype=float)
-    for i, tr in enumerate(roles):
-        row = confusion.get(tr, {}) or {}
-        for j, pr in enumerate(roles):
-            M[i, j] = float(row.get(pr, 0.0))
-    # Normalize rows to probabilities (avoid division by zero)
-    row_sums = M.sum(axis=1, keepdims=True)
-    norm = np.divide(M, np.where(row_sums == 0, 1.0, row_sums), where=np.ones_like(M, dtype=bool))
-    # Text annotations: show percentage and (count). On diagonal, also show F1 if provided
-    text = []
-    for i in range(n):
-        row = []
-        for j in range(n):
-            pct = norm[i, j] * 100.0
-            cell = f"{pct:.1f}%\n({int(M[i, j])})"
-            if i == j and f1_by_role is not None:
-                role = roles[i]
-                f1 = float(f1_by_role.get(role, 0.0)) if role in f1_by_role else 0.0
-                cell = f"{pct:.1f}%\n({int(M[i, j])})\nF1={f1:.2f}"
-            row.append(cell)
-        text.append(row)
-    fig = go.Figure(data=go.Heatmap(
-        z=norm,
-        x=roles,
-        y=roles,
-        colorscale="Blues",
-        reversescale=False,
-        zmin=0.0,
-        zmax=1.0,
-        text=text,
-        texttemplate="%{text}",
-        hoverinfo="skip",
-        showscale=True,
-        colorbar=dict(title="Row-normalized")
-    ))
-    fig.update_layout(title=title, xaxis_title="Predicted role", yaxis_title="True role")
-    plotly_offline_plot(fig, filename=str(run_dir / filename), auto_open=False, include_plotlyjs="cdn")
-
 
 
 def evaluate_config(
@@ -126,6 +320,8 @@ def evaluate_config(
     openai_api_key: str | None,
     llm_use_baseline_prompt: bool,
     baseline_mode: str = "full_transcript",
+    prompt_name: str = "mem_template",
+    llm_fixer: str = "none",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
 
@@ -180,7 +376,7 @@ def evaluate_config(
     total_entries = len(all_entries)
     last_report = 0.0
 
-    # For belief baseline: maintain per-game belief vectors as dict[player] -> role
+    # For belief baseline and LLM post-processing: per-game belief vectors as dict[player] -> role
     belief_state_by_game: Dict[str, Dict[str, str]] = defaultdict(dict)
 
     for qi, target in enumerate(all_entries):
@@ -200,59 +396,42 @@ def evaluate_config(
         topk_idx = list(I2[: k])
         topk_scores = list(D2[: k])
 
-        # Retrieval-only metrics removed in LLM-only mode
-
-        # Prompts and stats
+        # Prompts and stats (strategy-based)
         retrieved_pairs = [(all_entries[j], float(s)) for j, s in zip(topk_idx, topk_scores)]
-        # Classification task suffix (instructions + JSON schema requirement)
         roles_list = ", ".join(valid_roles) if valid_roles else ""
         task_suffix = "\n\nTask: Predict the role of the player who proposed the party."
         if roles_list:
             task_suffix += f" Valid roles: {roles_list}."
         task_suffix += (
             " Respond ONLY with a single-line JSON object matching this schema: "
-            "{\"role\": \"<ROLE>\"}. Do not include explanations, prefixes, or extra keys."
+            '{"role": "<ROLE>"}. Do not include explanations, prefixes, or extra keys.'
         )
 
-        # Build prompts: memory-augmented is unchanged; baseline depends on baseline_mode
-        prompt_mem_task, mem_meta = assemble_prompt_with_meta(target, retrieved_pairs, task_suffix=task_suffix)
+        ctx: Dict[str, Any] = {
+            "task_suffix": task_suffix,
+            "game_quests": game_quests,
+            "game_players": game_players,
+            "belief_state_by_game": belief_state_by_game,
+            "valid_roles": valid_roles,
+        }
 
-        gid = target.game_id
-        # Default baseline: full transcript template (legacy behavior)
-        if baseline_mode == "full_transcript":
-            prompt_base_task, base_meta = assemble_baseline_prompt_with_meta(target, task_suffix=task_suffix)
-        else:
-            # belief_vector baseline: build compact state + belief prompt
-            quests = game_quests.get(gid, {})
-            players = game_players.get(gid, [])
-            # Ensure stable belief state dict for this game
-            beliefs = belief_state_by_game[gid]
-            for p in players:
-                beliefs.setdefault(p, "unknown")
-            # Past state lines for quests < current quest
-            past_state_lines: List[str] = []
-            for q in sorted(quests.keys()):
-                if int(q) >= int(target.quest):
-                    continue
-                past_state_lines.append(quest_state_line(gid, int(q), quests[q]))
-            current_msgs = quests.get(int(target.quest), [])
-            current_transcript = quest_transcript_only(current_msgs)
-            prompt_base_task = assemble_belief_baseline_prompt(
-                game_id=gid,
-                players=players,
-                belief_vector=beliefs,
-                past_state_lines=past_state_lines,
-                current_quest=int(target.quest),
-                current_transcript=current_transcript,
-                valid_roles=valid_roles,
-            )
-            base_meta = {"mode": "belief_vector"}
+        prompt_fn = PROMPT_REGISTRY.get(prompt_name)
+        if prompt_fn is None:
+            raise ValueError(f"Unknown prompt strategy: {prompt_name}")
+
+        llm_prompt_text, prompt_meta = prompt_fn(target, retrieved_pairs, ctx)
+
+        # For backwards-compatible stats, treat this single prompt as both baseline and with-memory.
+        prompt_base_task = llm_prompt_text
+        prompt_mem_task = llm_prompt_text
+        base_meta = prompt_meta
+        mem_meta = prompt_meta
 
         pstats = prompt_stats(prompt_mem_task, prompt_base_task)
 
-        # Optional LLM call (uses augmented or baseline prompt depending on run mode)
-        llm_prompt = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
-        llm_out = llm_role_predict(llm_prompt, bool(use_llm), openai_model, openai_api_key)
+        # Optional LLM call (uses selected prompt depending on run mode)
+        llm_prompt_to_use = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
+        llm_out = llm_role_predict(llm_prompt_to_use, bool(use_llm), openai_model, openai_api_key)
 
         # Lightweight logging of LLM response and prompt length to monitor truncation/complaints
         if bool(use_llm):
@@ -272,7 +451,7 @@ def evaluate_config(
                 """.strip().format(
                     game=gid,
                     quest=target.quest,
-                    pchars=len(llm_prompt),
+                    pchars=len(llm_prompt_to_use),
                     error=repr(err),
                     warning=repr(warn),
                     preview=repr(preview),
@@ -282,52 +461,28 @@ def evaluate_config(
         # Proposer-role prediction (LLM or heuristic fallback)
         true_role = target.proposer_role
         pred_role = None
-        # Debug info for processed output
-        processed_used_repair = False
+        processed_used_repair: bool = False
         processed_beliefs_preview: str | None = None
         proposer_from_beliefs: str | None = None
         if bool(use_llm):
             raw_pred = llm_out.get("prediction")
-            pred_role = extract_role_label(raw_pred, valid_roles)
-            # If using belief baseline, parse/update beliefs robustly and derive proposer role
-            if baseline_mode == "belief_vector" and llm_use_baseline_prompt:
-                beliefs_obj: Dict[str, Any] | None = None
-                # 1) Try robust local extraction
-                beliefs_container = extract_beliefs_object(raw_pred or "")
-                if isinstance(beliefs_container, dict):
-                    beliefs_obj = beliefs_container.get("beliefs") if isinstance(beliefs_container.get("beliefs"), dict) else None
-                # 2) If still missing, attempt a one-shot TypeChat-style repair
-                if beliefs_obj is None:
-                    schema_hint = '{"beliefs": {"player-1": "<ROLE>", "player-2": "<ROLE>", ...}}'
-                    repaired = typechat_repair_to_json(raw_pred or "", schema_hint, openai_model, openai_api_key, True)
-                    repaired_container = extract_beliefs_object(repaired or "") if repaired else None
-                    if isinstance(repaired_container, dict):
-                        beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
-                        processed_used_repair = True
-                # 3) Apply updates and set pred_role from proposer
-                if isinstance(beliefs_obj, dict):
-                    beliefs = belief_state_by_game[gid]
-                    for p, r in beliefs_obj.items():
-                        if isinstance(r, str):
-                            beliefs[str(p)] = r.strip()
-                    # Build a compact preview of the parsed beliefs JSON for debugging
-                    try:
-                        processed_beliefs_preview = json.dumps({"beliefs": beliefs_obj})[:160]
-                    except Exception:
-                        processed_beliefs_preview = None
-                    if isinstance(target.proposer, str):
-                        pr = beliefs.get(target.proposer)
-                        if isinstance(pr, str) and any(pr.lower() == vr.lower() for vr in valid_roles):
-                            pred_role = next(vr for vr in valid_roles if pr.lower() == vr.lower())
-                            proposer_from_beliefs = pred_role
-                # If still no pred_role (repair may have produced role-only JSON), try role repair
-                if pred_role is None:
-                    schema_hint_role = '{"role": "<ROLE>"}'
-                    repaired_role = typechat_repair_to_json(raw_pred or "", schema_hint_role, openai_model, openai_api_key, True)
-                    pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
-                    if pr2 is not None and pred_role is None:
-                        processed_used_repair = True
-                    pred_role = pred_role or pr2
+            post_fn = LLM_POST_REGISTRY.get(llm_fixer)
+            if post_fn is None:
+                raise ValueError(f"Unknown LLM post-processor: {llm_fixer}")
+            post_out = post_fn(
+                raw_pred,
+                valid_roles,
+                {
+                    "openai_model": openai_model,
+                    "openai_api_key": openai_api_key,
+                    "target": target,
+                    "belief_state_by_game": belief_state_by_game,
+                },
+            )
+            pred_role = post_out.get("pred_role")
+            processed_used_repair = bool(post_out.get("used_repair"))
+            processed_beliefs_preview = post_out.get("beliefs_preview")
+            proposer_from_beliefs = post_out.get("proposer_from_beliefs")
         else:
             # Fallback heuristic: transfer top-1 retrieved proposer_role
             if len(I2) > 0:
@@ -451,7 +606,7 @@ def evaluate_config(
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Evaluate retrieval and prompting pipeline over an Avalon dataset.")
     ap.add_argument("--data_dir", type=str, default="dataset", help="Directory containing *.json games")
-    ap.add_argument("--k", type=int, default=3, help="Top-k for retrieval and Recall@k")
+    ap.add_argument("--k", type=int, default=3, help="Top-k for retrieval")
     ap.add_argument("--memory_format", type=str, default="template", choices=["template", "template+summary"], help="Memory format for entries")
     ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer embedding model name")
     ap.add_argument("--outdir", type=str, default="outputs/eval", help="Base output directory for saving results and visuals")
@@ -461,7 +616,12 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
-    ap.add_argument("--baseline_mode", type=str, default="full_transcript", choices=["full_transcript", "belief_vector"], help="Baseline prompting mode: full transcript per round or iterative belief-vector baseline.")
+
+    # New high-level experiment knobs
+    ap.add_argument("--baseline_prompt", type=str, default="baseline_full_transcript", help="Prompt strategy name for baseline (see README for options). Use 'none' to skip.")
+    ap.add_argument("--current_prompt", type=str, default="mem_template", help="Prompt strategy name for current (memory-augmented) run. Use 'none' to skip.")
+    ap.add_argument("--llm_fixer", type=str, default="none", choices=list(LLM_POST_REGISTRY.keys()), help="How to post-process LLM JSON output (TypeChat repair, etc.).")
+    ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary"], help="Named experiment preset. 'custom' uses provided arguments.")
     args = ap.parse_args(argv)
 
     # Heuristic auto-correction: users sometimes pass the LLM model to --model.
@@ -481,6 +641,17 @@ def main(argv: List[str] | None = None) -> int:
                 args.model = default_embed_model
     except Exception:
         pass
+
+    # Apply experiment presets on top of parsed args
+    if args.exp == "baseline_full":
+        args.baseline_prompt = "baseline_full_transcript"
+        args.current_prompt = "none"
+    elif args.exp == "baseline_vs_template":
+        args.baseline_prompt = "baseline_full_transcript"
+        args.current_prompt = "mem_template"
+    elif args.exp == "baseline_vs_template+summary":
+        args.baseline_prompt = "baseline_full_transcript"
+        args.current_prompt = "mem_template+summary"
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
@@ -518,7 +689,7 @@ def main(argv: List[str] | None = None) -> int:
         print(f"[warn] Pre-run estimation unavailable: {e}")
 
     ts = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
-    run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_mem-{args.memory_format}_llm"
+    run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_mem-{args.memory_format}_exp-{args.exp}"
     ensure_dir(run_dir)
 
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
@@ -538,50 +709,58 @@ def main(argv: List[str] | None = None) -> int:
             pass
 
         # Baseline
-        print("  Evaluating baseline (no memory in prompt), memory_format=template")
-        agg_base_i, res_base_i = evaluate_config(
-            files=files,
-            k=int(args.k),
-            memory_format="template",
-            model_name=args.model,
-            use_llm=bool(args.llm),
-            openai_model=args.llm_model,
-            openai_api_key=args.openai_api_key,
-            llm_use_baseline_prompt=True,
-            baseline_mode=str(args.baseline_mode),
-        )
-        agg_base_runs.append(agg_base_i)
-        with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
-            json.dump(res_base_i, f, ensure_ascii=False, indent=2)
-        with (run_subdir / "aggregate_baseline.json").open("w", encoding="utf-8") as f:
-            json.dump(agg_base_i, f, ensure_ascii=False, indent=2)
+        if args.baseline_prompt != "none":
+            print(f"  Evaluating baseline strategy='{args.baseline_prompt}', memory_format=template")
+            agg_base_i, res_base_i = evaluate_config(
+                files=files,
+                k=int(args.k),
+                memory_format="template",
+                model_name=args.model,
+                use_llm=bool(args.llm),
+                openai_model=args.llm_model,
+                openai_api_key=args.openai_api_key,
+                llm_use_baseline_prompt=True,
+                baseline_mode="full_transcript",
+                prompt_name=args.baseline_prompt,
+                llm_fixer=args.llm_fixer,
+            )
+            agg_base_runs.append(agg_base_i)
+            with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
+                json.dump(res_base_i, f, ensure_ascii=False, indent=2)
+            with (run_subdir / "aggregate_baseline.json").open("w", encoding="utf-8") as f:
+                json.dump(agg_base_i, f, ensure_ascii=False, indent=2)
 
         # Current
-        print(f"  Evaluating current (with memory in prompt), memory_format={args.memory_format}")
-        agg_cur_i, res_cur_i = evaluate_config(
-            files=files,
-            k=int(args.k),
-            memory_format=args.memory_format,
-            model_name=args.model,
-            use_llm=bool(args.llm),
-            openai_model=args.llm_model,
-            openai_api_key=args.openai_api_key,
-            llm_use_baseline_prompt=False,
-            baseline_mode=str(args.baseline_mode),
-        )
-        agg_cur_runs.append(agg_cur_i)
-        with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
-            json.dump(res_cur_i, f, ensure_ascii=False, indent=2)
-        with (run_subdir / "aggregate_current.json").open("w", encoding="utf-8") as f:
-            json.dump(agg_cur_i, f, ensure_ascii=False, indent=2)
+        if args.current_prompt != "none":
+            print(f"  Evaluating current strategy='{args.current_prompt}', memory_format={args.memory_format}")
+            agg_cur_i, res_cur_i = evaluate_config(
+                files=files,
+                k=int(args.k),
+                memory_format=args.memory_format,
+                model_name=args.model,
+                use_llm=bool(args.llm),
+                openai_model=args.llm_model,
+                openai_api_key=args.openai_api_key,
+                llm_use_baseline_prompt=False,
+                baseline_mode="full_transcript",
+                prompt_name=args.current_prompt,
+                llm_fixer=args.llm_fixer,
+            )
+            agg_cur_runs.append(agg_cur_i)
+            with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
+                json.dump(res_cur_i, f, ensure_ascii=False, indent=2)
+            with (run_subdir / "aggregate_current.json").open("w", encoding="utf-8") as f:
+                json.dump(agg_cur_i, f, ensure_ascii=False, indent=2)
 
     # Averages across runs
-    agg_base = average_aggregates(agg_base_runs)
-    agg_cur = average_aggregates(agg_cur_runs)
-    with (run_dir / "aggregate_baseline_mean.json").open("w", encoding="utf-8") as f:
-        json.dump(agg_base, f, ensure_ascii=False, indent=2)
-    with (run_dir / "aggregate_current_mean.json").open("w", encoding="utf-8") as f:
-        json.dump(agg_cur, f, ensure_ascii=False, indent=2)
+    agg_base = average_aggregates(agg_base_runs) if agg_base_runs else {}
+    agg_cur = average_aggregates(agg_cur_runs) if agg_cur_runs else {}
+    if agg_base_runs:
+        with (run_dir / "aggregate_baseline_mean.json").open("w", encoding="utf-8") as f:
+            json.dump(agg_base, f, ensure_ascii=False, indent=2)
+    if agg_cur_runs:
+        with (run_dir / "aggregate_current_mean.json").open("w", encoding="utf-8") as f:
+            json.dump(agg_cur, f, ensure_ascii=False, indent=2)
     combined = {"baseline": agg_base, "current": agg_cur}
     with (run_dir / "aggregate_combined_mean.json").open("w", encoding="utf-8") as f:
         json.dump(combined, f, ensure_ascii=False, indent=2)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import re
 from typing import Any, Dict, List, Tuple
-from scripts.memory_utils import MemoryEntry, heuristic_summary
+from scripts.template_summary import MemoryEntry, heuristic_summary
 
 # ---------- Basic prompt assembly ----------
 

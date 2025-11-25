@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+"""Template+summary memory augmentation utilities.
+
+This module was previously named `memory_utils.py`. It focuses on
+template-based memory entries and a simple heuristic summary used as
+one memory-augmentation technique.
+"""
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
 import json
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
+
 
 @dataclass
 class MemoryEntry:
@@ -39,10 +48,7 @@ def messages_by_quest(game: Dict) -> Dict[int, List[Dict]]:
 
 
 def quest_state_line(game_id: str, quest: int, msgs: List[Dict]) -> str:
-    """Build a compact state line for a given quest.
-
-    Follows the paper-style template: `quest-i: oi (party: pj | player votes: vj)`.
-    """
+    """Build a compact state line for a given quest."""
     party_members: List[str] = []
     votes: List[str] = []
     outcome: str = "unknown"
@@ -55,7 +61,6 @@ def quest_state_line(game_id: str, quest: int, msgs: List[Dict]) -> str:
                 if p:
                     party_members = [s.strip() for s in p.split(",") if s.strip()]
             if msg.startswith("party vote outcome:"):
-                # Raw system line already describes votes; keep compact suffix
                 votes.append(msg.replace("party vote outcome:", "").strip())
             if msg.endswith("quest succeeded!"):
                 outcome = "success"
@@ -78,7 +83,9 @@ def quest_transcript_only(msgs: List[Dict]) -> str:
         lines.append(f"[Turn {turn}] {player}: {msg}")
     return "\n".join(lines)
 
+
 _party_re = re.compile(r"proposed a party:\s*(.*)$")
+
 
 def extract_party(line: str) -> str | None:
     m = _party_re.search(line)
@@ -97,7 +104,6 @@ def build_template_entry_for_quest(game: Dict, game_id: str, quest: int, msgs: L
     proposer: str | None = None
     proposer_role: str | None = None
 
-    # Build helper map from player name to role (if available)
     name_to_role: Dict[str, str] = {}
     try:
         for u in (game.get("users", {}) or {}).values():
@@ -116,9 +122,7 @@ def build_template_entry_for_quest(game: Dict, game_id: str, quest: int, msgs: L
             system_lines.append(msg)
             if "proposed a party:" in msg:
                 proposed_party = extract_party(msg)
-                # Try to parse proposer name before " proposed a party:"
                 try:
-                    # Expected format: "player-4 proposed a party: ..."
                     proposer_token = msg.split(" proposed a party:", 1)[0].strip()
                     proposer = proposer_token or proposer
                     if proposer and proposer_role is None:
@@ -247,10 +251,6 @@ def rerank_temporal(entries: List[MemoryEntry], indices: Iterable[int], scores: 
     pairs.sort(key=lambda x: -x[1])
     return pairs
 
-
-
-
-# ---------- Math helper ----------
 
 def pca_2d(x: np.ndarray, center: bool = True) -> np.ndarray:
     X = x.astype(np.float64)
