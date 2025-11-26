@@ -227,6 +227,8 @@ def llm_post_typechat_role(
     openai_api_key: Optional[str] = ctx.get("openai_api_key")
     base_role = extract_role_label(raw_pred, valid_roles)
     used_repair = False
+    repair_attempted = False
+    repaired_preview: Optional[str] = None
     # Trigger repair when we either have no parsed role OR the model answered
     # with free-form text that is not valid JSON (common failure mode).
     needs_repair = False
@@ -243,6 +245,12 @@ def llm_post_typechat_role(
     if needs_repair and text:
         schema_hint_role = '{"role": "<ROLE>"}'
         repaired_role = typechat_repair_to_json(text, schema_hint_role, openai_model, openai_api_key, True)
+        repair_attempted = True
+        if isinstance(repaired_role, str):
+            try:
+                repaired_preview = repaired_role.replace("\n", " ")[:160]
+            except Exception:
+                repaired_preview = None
         repaired_parsed = extract_role_label(repaired_role, valid_roles) if repaired_role else None
         if repaired_parsed is not None:
             base_role = repaired_parsed
@@ -251,6 +259,8 @@ def llm_post_typechat_role(
         "pred_role": base_role,
         "beliefs_obj": None,
         "used_repair": used_repair,
+        "repair_attempted": repair_attempted,
+        "repaired_preview": repaired_preview,
         "proposer_from_beliefs": None,
         "beliefs_preview": None,
     }
@@ -272,6 +282,8 @@ def llm_post_typechat_beliefs(
 
     beliefs_obj: Dict[str, Any] | None = None
     used_repair = False
+    repair_attempted = False
+    repaired_preview: Optional[str] = None
     beliefs_preview: Optional[str] = None
     proposer_from_beliefs: Optional[str] = None
 
@@ -289,6 +301,12 @@ def llm_post_typechat_beliefs(
             inner = '"player-1": "<ROLE>", "player-2": "<ROLE>"'
         schema_hint = '{"beliefs": {' + inner + '}}'
         repaired = typechat_repair_to_json(text, schema_hint, openai_model, openai_api_key, True)
+        repair_attempted = True
+        if isinstance(repaired, str):
+            try:
+                repaired_preview = repaired.replace("\n", " ")[:160]
+            except Exception:
+                repaired_preview = None
         repaired_container = extract_beliefs_object(repaired or "") if repaired else None
         if isinstance(repaired_container, dict):
             beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
@@ -323,6 +341,8 @@ def llm_post_typechat_beliefs(
         "pred_role": pred_role,
         "beliefs_obj": beliefs_obj,
         "used_repair": used_repair,
+        "repair_attempted": repair_attempted,
+        "repaired_preview": repaired_preview,
         "proposer_from_beliefs": proposer_from_beliefs,
         "beliefs_preview": beliefs_preview,
     }
@@ -593,6 +613,23 @@ def evaluate_config(
                 "pred_role": pred_role,
             },
         }
+        # Persist how the output was fixed/processed for transparency
+        if bool(use_llm) and llm_fixer != "none":
+            res["llm_processed"] = {
+                "fixer": llm_fixer,
+                "used_repair": bool(processed_used_repair),
+                "repair_attempted": bool(post_out.get("repair_attempted")),
+                "repaired_preview": post_out.get("repaired_preview"),
+                # Only include beliefs fields when beliefs fixer is active
+                **(
+                    {
+                        "beliefs_preview": processed_beliefs_preview,
+                        "proposer_from_beliefs": proposer_from_beliefs,
+                    }
+                    if llm_fixer == "typechat_beliefs"
+                    else {}
+                ),
+            }
         results.append(res)
 
         # Progress print every ~10% or each 100 entries
@@ -840,13 +877,17 @@ def main(argv: List[str] | None = None) -> int:
             writer = csv.writer(fcsv)
             writer.writerow(["approach", *roles, "micro_f1"])
             writer.writerow(["baseline", *[f"{agg_base['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles], f"{agg_base.get('clf_micro_f1', 0.0):.3f}"])
-            writer.writerow(["current", *[f"{agg_cur['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles], f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"])
+            if agg_cur.get("clf_by_role"):
+                writer.writerow(["current", *[f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles], f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"])
         # TXT (tab-delimited)
         header = ["approach"] + roles + ["micro_f1"]
         lines = ["\t".join(header)]
         base_vals = ["baseline"] + [f"{agg_base['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles] + [f"{agg_base.get('clf_micro_f1', 0.0):.3f}"]
-        cur_vals = ["current"] + [f"{agg_cur['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles] + [f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"]
-        (run_dir / "role_f1_table.txt").write_text("\n".join([*lines, "\t".join(base_vals), "\t".join(cur_vals)]) + "\n", encoding="utf-8")
+        content_lines = [*lines, "\t".join(base_vals)]
+        if agg_cur.get("clf_by_role"):
+            cur_vals = ["current"] + [f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles] + [f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"]
+            content_lines.append("\t".join(cur_vals))
+        (run_dir / "role_f1_table.txt").write_text("\n".join(content_lines) + "\n", encoding="utf-8")
 
         # Optional: save per-run F1s for transparency (if num_runs > 1)
         if int(getattr(args, "num_runs", 1)) > 1:
@@ -863,7 +904,9 @@ def main(argv: List[str] | None = None) -> int:
                         writer.writerow([i, "current", r, f"{a.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}"])
 
     # Visualizations: confusion matrices and current prompt sizes
-    viz_prompt_lengths(run_dir, agg_cur["avg_prompt_sizes"])  # focuses on current config’s prompts
+    # Only visualize current prompt lengths if we have current-run aggregates
+    if "avg_prompt_sizes" in agg_cur:
+        viz_prompt_lengths(run_dir, agg_cur["avg_prompt_sizes"])  # focuses on current config’s prompts
 
     # Note: Retrieval-only plots intentionally omitted in LLM-only mode.
 
