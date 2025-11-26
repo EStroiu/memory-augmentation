@@ -11,6 +11,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional, Protocol, Callable
+
+# Ensure repo root is importable when running as a script (python scripts/...)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
@@ -40,11 +46,6 @@ from scripts.prompting import (
     assemble_belief_baseline_prompt,
     prompt_stats,
 )
-
-# Ensure repo root is importable when running as a script (python scripts/...)
-if str(Path(__file__).resolve().parents[1]) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 
 @dataclass
 class ExperimentConfig:
@@ -226,9 +227,22 @@ def llm_post_typechat_role(
     openai_api_key: Optional[str] = ctx.get("openai_api_key")
     base_role = extract_role_label(raw_pred, valid_roles)
     used_repair = False
-    if base_role is None and raw_pred:
+    # Trigger repair when we either have no parsed role OR the model answered
+    # with free-form text that is not valid JSON (common failure mode).
+    needs_repair = False
+    text = raw_pred or ""
+    if base_role is None and text:
+        needs_repair = True
+    else:
+        # If the text does not look like JSON at all (no leading '{'),
+        # treat it as a candidate for repair even if we guessed a role.
+        stripped = text.lstrip()
+        if stripped and not stripped.startswith("{"):
+            needs_repair = True
+
+    if needs_repair and text:
         schema_hint_role = '{"role": "<ROLE>"}'
-        repaired_role = typechat_repair_to_json(raw_pred, schema_hint_role, openai_model, openai_api_key, True)
+        repaired_role = typechat_repair_to_json(text, schema_hint_role, openai_model, openai_api_key, True)
         repaired_parsed = extract_role_label(repaired_role, valid_roles) if repaired_role else None
         if repaired_parsed is not None:
             base_role = repaired_parsed
@@ -254,6 +268,7 @@ def llm_post_typechat_beliefs(
     openai_api_key: Optional[str] = ctx.get("openai_api_key")
     target: MemoryEntry = ctx["target"]
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
+    game_players: Dict[str, List[str]] = ctx.get("game_players", {})
 
     beliefs_obj: Dict[str, Any] | None = None
     used_repair = False
@@ -265,7 +280,14 @@ def llm_post_typechat_beliefs(
     if isinstance(beliefs_container, dict):
         beliefs_obj = beliefs_container.get("beliefs") if isinstance(beliefs_container.get("beliefs"), dict) else None
     if beliefs_obj is None and text:
-        schema_hint = '{"beliefs": {"player-1": "<ROLE>", "player-2": "<ROLE>", ...}}'
+        # Build a concrete schema using the actual player names for this game.
+        players = game_players.get(target.game_id, [])
+        # Fall back to generic keys if players are unavailable.
+        if players:
+            inner = ", ".join([f'"{p}": "<ROLE>"' for p in players])
+        else:
+            inner = '"player-1": "<ROLE>", "player-2": "<ROLE>"'
+        schema_hint = '{"beliefs": {' + inner + '}}'
         repaired = typechat_repair_to_json(text, schema_hint, openai_model, openai_api_key, True)
         repaired_container = extract_beliefs_object(repaired or "") if repaired else None
         if isinstance(repaired_container, dict):
@@ -379,6 +401,10 @@ def evaluate_config(
     # For belief baseline and LLM post-processing: per-game belief vectors as dict[player] -> role
     belief_state_by_game: Dict[str, Dict[str, str]] = defaultdict(dict)
 
+    # LLM fixer statistics
+    fixer_total_calls: int = 0
+    fixer_used_repair: int = 0
+
     for qi, target in enumerate(all_entries):
         q_vec = model.encode([target.text], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
         # Retrieve more than k for stability
@@ -469,6 +495,7 @@ def evaluate_config(
             post_fn = LLM_POST_REGISTRY.get(llm_fixer)
             if post_fn is None:
                 raise ValueError(f"Unknown LLM post-processor: {llm_fixer}")
+            fixer_total_calls += 1
             post_out = post_fn(
                 raw_pred,
                 valid_roles,
@@ -477,10 +504,13 @@ def evaluate_config(
                     "openai_api_key": openai_api_key,
                     "target": target,
                     "belief_state_by_game": belief_state_by_game,
+                    "game_players": game_players,
                 },
             )
             pred_role = post_out.get("pred_role")
             processed_used_repair = bool(post_out.get("used_repair"))
+            if processed_used_repair:
+                fixer_used_repair += 1
             processed_beliefs_preview = post_out.get("beliefs_preview")
             proposer_from_beliefs = post_out.get("proposer_from_beliefs")
         else:
@@ -503,26 +533,50 @@ def evaluate_config(
             conf_counts[true_role][pred_role] += 1
 
         # Optional: print a processed view for debugging
-        if bool(use_llm):
-            print(
-                (
-                    """
+        # Only show this block when an LLM fixer other than "none" is active
+        # and when the post-processor actually performed some repair/processing.
+        if bool(use_llm) and llm_fixer != "none" and processed_used_repair:
+            if llm_fixer == "typechat_beliefs":
+                print(
+                    (
+                        """
     [llm-processed]
       game: {game}  quest: {quest}
+      fixer: {fixer}
       role_parsed: {role}
       proposer_from_beliefs: {proposer_role}
       used_repair: {used_repair}
       beliefs_preview: {beliefs_preview}
-                    """.strip()
-                ).format(
-                    game=gid,
-                    quest=target.quest,
-                    role=repr(pred_role),
-                    proposer_role=repr(proposer_from_beliefs),
-                    used_repair=repr(processed_used_repair),
-                    beliefs_preview=repr(processed_beliefs_preview),
+                        """.strip()
+                    ).format(
+                        game=gid,
+                        quest=target.quest,
+                        fixer=llm_fixer,
+                        role=repr(pred_role),
+                        proposer_role=repr(proposer_from_beliefs),
+                        used_repair=repr(processed_used_repair),
+                        beliefs_preview=repr(processed_beliefs_preview),
+                    )
                 )
-            )
+            else:
+                # Role-only fixer: omit beliefs-specific fields for clarity
+                print(
+                    (
+                        """
+    [llm-processed]
+      game: {game}  quest: {quest}
+      fixer: {fixer}
+      role_parsed: {role}
+      used_repair: {used_repair}
+                        """.strip()
+                    ).format(
+                        game=gid,
+                        quest=target.quest,
+                        fixer=llm_fixer,
+                        role=repr(pred_role),
+                        used_repair=repr(processed_used_repair),
+                    )
+                )
 
         res = {
             "target": asdict(target),
@@ -589,6 +643,12 @@ def evaluate_config(
 
     total_elapsed = time.time() - t0
     print(f"    [done] memory_format='{memory_format}' finished in {total_elapsed:.2f}s")
+    if use_llm and fixer_total_calls > 0:
+        repair_rate = fixer_used_repair / fixer_total_calls if fixer_total_calls > 0 else 0.0
+        print(
+            f"    [llm-fixer] fixer='{llm_fixer}' calls={fixer_total_calls} "
+            f"repairs={fixer_used_repair} repair_rate={repair_rate:.3f}"
+        )
     agg = {
         "k": int(k),
         "memory_format": memory_format,
@@ -597,6 +657,12 @@ def evaluate_config(
         "clf_by_role": clf_by_role,
         "clf_micro_f1": micro_f1,
         "clf_confusion": {tr: dict(prs) for tr, prs in conf_counts.items()},
+        "llm_fixer_stats": {
+            "fixer": llm_fixer,
+            "total_calls": fixer_total_calls,
+            "used_repair": fixer_used_repair,
+            "repair_rate": (fixer_used_repair / fixer_total_calls) if fixer_total_calls > 0 else 0.0,
+        },
     }
     return agg, results
 
