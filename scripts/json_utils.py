@@ -104,8 +104,10 @@ def typechat_repair_to_json(
         return None
     try:
         repair_prompt = (
-            "Convert the following answer into strict JSON only. "
-            "Do not include any explanation or extra keys.\n"
+            "You are a strict JSON converter."
+            " Always output exactly one JSON object matching the schema,"
+            " with no prose, prefixes, or extra keys."
+            " If information is missing, still emit the required keys and set values to 'unknown'.\n"
             f"Schema: {schema_hint}\n"
             "Answer to convert:\n"
             "<<<\n" + raw_text + "\n>>>\n"
