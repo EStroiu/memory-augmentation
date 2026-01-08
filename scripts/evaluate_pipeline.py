@@ -47,6 +47,14 @@ from scripts.prompting import (
     prompt_stats,
 )
 
+from scripts.vector_memory import (
+    init_vector_state,
+    update_from_transcript,
+    update_from_quest_outcome,
+    render_vector_memory,
+    state_preview_json,
+)
+
 @dataclass
 class ExperimentConfig:
     """High-level configuration for a single experiment run.
@@ -195,6 +203,62 @@ def prompt_mem_template_summary(
     """
     task_suffix: str = ctx.get("task_suffix", "")
     return assemble_prompt_with_meta(target, retrieved, task_suffix=task_suffix)
+
+
+@register_prompt("vector_memory")
+def prompt_vector_memory(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Prompt strategy that injects a compact per-player belief vector.
+
+    This keeps the rest of the pipeline unchanged, and only adds an extra
+    context block before the task.
+    """
+
+    task_suffix: str = ctx.get("task_suffix", "")
+    game_id: str = target.game_id
+    quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
+    players: List[str] = ctx["game_players"].get(game_id, [])
+
+    # Stateful vector memory per game
+    vector_state_by_game: Dict[str, Any] = ctx.setdefault("vector_state_by_game", {})
+    state = vector_state_by_game.get(game_id)
+    if state is None:
+        state = init_vector_state(players)
+        vector_state_by_game[game_id] = state
+
+    # Update vector memory from past quest transcripts & outcomes (< current quest)
+    for q in sorted(quests.keys()):
+        if int(q) >= int(target.quest):
+            continue
+        msgs = quests.get(int(q), [])
+        update_from_transcript(state, players, msgs)
+        # Try to infer quest outcome from messages (best-effort). If not found, no-op.
+        # Supported keys: "quest_failed" or "success" in any msg dict.
+        quest_failed = None
+        for m in msgs:
+            if "quest_failed" in m:
+                quest_failed = bool(m.get("quest_failed"))
+            elif "success" in m:
+                quest_failed = not bool(m.get("success"))
+        # Team is also best-effort; if absent, skip outcome update.
+        team = []
+        for m in msgs:
+            if "team" in m and isinstance(m.get("team"), list):
+                team = [str(x) for x in m.get("team")]
+        if team:
+            update_from_quest_outcome(state, players, team, quest_failed)
+
+    vec_block = render_vector_memory(state, players)
+
+    # Base template prompt + retrieved memory (keeps your existing augmentation)
+    base_prompt, meta = assemble_prompt_with_meta(target, retrieved, task_suffix="")
+    prompt = base_prompt + "\n\n" + vec_block + "\n" + task_suffix
+    meta["mode"] = "vector_memory"
+    meta["vector_memory_preview"] = state_preview_json(state, players)
+    return prompt, meta
 
 
 @register_llm_post("none")
@@ -421,6 +485,9 @@ def evaluate_config(
     # For belief baseline and LLM post-processing: per-game belief vectors as dict[player] -> role
     belief_state_by_game: Dict[str, Dict[str, str]] = defaultdict(dict)
 
+    # For vector_memory prompt: per-game vector states
+    vector_state_by_game: Dict[str, Any] = {}
+
     # LLM fixer statistics
     fixer_total_calls: int = 0
     fixer_used_repair: int = 0
@@ -459,6 +526,7 @@ def evaluate_config(
             "game_players": game_players,
             "belief_state_by_game": belief_state_by_game,
             "valid_roles": valid_roles,
+            "vector_state_by_game": vector_state_by_game,
         }
 
         prompt_fn = PROMPT_REGISTRY.get(prompt_name)
@@ -613,6 +681,14 @@ def evaluate_config(
                 "pred_role": pred_role,
             },
         }
+
+        # Persist vector-memory preview if used by the prompt strategy
+        try:
+            vm_prev = mem_meta.get("vector_memory_preview") if isinstance(mem_meta, dict) else None
+            if vm_prev is not None:
+                res["vector_memory"] = {"preview": vm_prev}
+        except Exception:
+            pass
         # Persist how the output was fixed/processed for transparency
         if bool(use_llm) and llm_fixer != "none":
             res["llm_processed"] = {
@@ -720,12 +796,33 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
 
+    # Performance knobs (propagated via env vars for SentenceTransformer)
+    ap.add_argument("--embed_batch_size", type=int, default=int(os.getenv("EMBED_BATCH_SIZE", "64")), help="Embedding batch size (higher -> faster on GPU, may use more VRAM)")
+    ap.add_argument("--embed_cache", action="store_true", default=os.getenv("EMBED_CACHE", "1").strip().lower() not in ("0", "false", "no"), help="Cache embeddings to disk for faster reruns")
+    ap.add_argument("--no_embed_cache", action="store_true", help="Disable embedding cache")
+    ap.add_argument("--embed_use_gpu", action="store_true", default=os.getenv("EMBED_USE_GPU", "1").strip().lower() not in ("0", "false", "no"), help="Prefer GPU for embeddings when available")
+    ap.add_argument("--no_embed_use_gpu", action="store_true", help="Disable GPU usage for embeddings")
+
     # New high-level experiment knobs
     ap.add_argument("--baseline_prompt", type=str, default="baseline_full_transcript", help="Prompt strategy name for baseline (see README for options). Use 'none' to skip.")
     ap.add_argument("--current_prompt", type=str, default="mem_template", help="Prompt strategy name for current (memory-augmented) run. Use 'none' to skip.")
     ap.add_argument("--llm_fixer", type=str, default="none", choices=list(LLM_POST_REGISTRY.keys()), help="How to post-process LLM JSON output (TypeChat repair, etc.).")
     ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary"], help="Named experiment preset. 'custom' uses provided arguments.")
     args = ap.parse_args(argv)
+
+    # Apply performance flags to environment for downstream modules
+    try:
+        os.environ["EMBED_BATCH_SIZE"] = str(int(args.embed_batch_size))
+        if bool(args.no_embed_cache):
+            os.environ["EMBED_CACHE"] = "0"
+        else:
+            os.environ["EMBED_CACHE"] = "1" if bool(args.embed_cache) else "0"
+        if bool(args.no_embed_use_gpu):
+            os.environ["EMBED_USE_GPU"] = "0"
+        else:
+            os.environ["EMBED_USE_GPU"] = "1" if bool(args.embed_use_gpu) else "0"
+    except Exception:
+        pass
 
     # Heuristic auto-correction: users sometimes pass the LLM model to --model.
     # If --model looks like an LLM identifier and --llm_model is still default, swap them.

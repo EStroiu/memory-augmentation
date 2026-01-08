@@ -9,11 +9,13 @@ one memory-augmentation technique.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 import json
 import math
 import re
 from collections import defaultdict
+import os
+import hashlib
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -212,10 +214,66 @@ def build_memory_entries(game: Dict, game_id: str, memory_format: str = "templat
 def build_embeddings(entries: List[MemoryEntry], model_name: str) -> Tuple[np.ndarray, Any]:
     if SentenceTransformer is None:
         raise ImportError("sentence-transformers is required. pip install -r requirements.txt")
-    model = SentenceTransformer(model_name)
+    # --- Performance knobs (override via env vars) ---
+    batch_size = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+    use_cache = os.getenv("EMBED_CACHE", "1").strip().lower() not in ("0", "false", "no")
+    cache_dir = os.getenv("EMBED_CACHE_DIR", "outputs/cache/embeddings")
+    prefer_gpu = os.getenv("EMBED_USE_GPU", "1").strip().lower() not in ("0", "false", "no")
+
+    # Decide device (SentenceTransformer supports device=...)
+    device: Optional[str] = None
+    if prefer_gpu:
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                device = "cuda"
+        except Exception:
+            device = None
+
+    # Cache key: model + text contents
     corpus = [e.text for e in entries]
-    emb = model.encode(corpus, batch_size=16, show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True)
-    return emb.astype("float32"), model
+    cache_path: Optional[Path] = None
+    if use_cache:
+        try:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            h = hashlib.sha256()
+            h.update(model_name.encode("utf-8"))
+            # Include length and a subset to avoid huge hashing cost
+            h.update(str(len(corpus)).encode("utf-8"))
+            for t in corpus[:64]:
+                h.update(t.encode("utf-8", errors="ignore"))
+            cache_path = Path(cache_dir) / f"emb_{h.hexdigest()[:16]}.npz"
+        except Exception:
+            cache_path = None
+
+    if cache_path is not None and cache_path.exists():
+        try:
+            data = np.load(str(cache_path))
+            emb = data["emb"].astype("float32")
+            # We still return a model handle because callers use it for query encoding.
+            model = SentenceTransformer(model_name, device=device) if device else SentenceTransformer(model_name)
+            return emb, model
+        except Exception:
+            pass
+
+    model = SentenceTransformer(model_name, device=device) if device else SentenceTransformer(model_name)
+    emb = model.encode(
+        corpus,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    emb = emb.astype("float32")
+
+    if cache_path is not None:
+        try:
+            np.savez_compressed(str(cache_path), emb=emb)
+        except Exception:
+            pass
+
+    return emb, model
 
 
 def build_faiss_ip_index(embeddings: np.ndarray) -> Any:
