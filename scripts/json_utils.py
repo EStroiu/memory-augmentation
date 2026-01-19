@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from scripts.llm_client import llm_role_predict
 
 
@@ -94,6 +94,7 @@ def typechat_repair_to_json(
     model_name: str,
     api_key: str | None,
     enabled: bool,
+    trace: Optional[List[Dict[str, Any]]] = None,
 ) -> str | None:
     """One-shot repair call that asks the LLM to emit strict JSON only.
 
@@ -114,6 +115,18 @@ def typechat_repair_to_json(
             "Output JSON only on a single line."
         )
         rep = llm_role_predict(repair_prompt, True, model_name, api_key)
+        if isinstance(trace, list):
+            trace.append(
+                {
+                    "kind": "repair",
+                    "provider": rep.get("provider"),
+                    "model": rep.get("model") or model_name,
+                    "duration_s": rep.get("duration_s"),
+                    "prompt": repair_prompt,
+                    "response": rep.get("prediction"),
+                    "error": rep.get("error") or rep.get("note"),
+                }
+            )
         return rep.get("prediction")
     except Exception:
         return None

@@ -53,6 +53,9 @@ from scripts.vector_memory import (
     update_from_quest_outcome,
     render_vector_memory,
     state_preview_json,
+    default_max_players,
+    parse_party_and_outcome_from_msgs,
+    summarize_state,
 )
 
 @dataclass
@@ -222,42 +225,42 @@ def prompt_vector_memory(
     quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
     players: List[str] = ctx["game_players"].get(game_id, [])
 
-    # Stateful vector memory per game
+    # Stateful vector memory per game.
+    # IMPORTANT: keep track of which quests we've already incorporated; otherwise
+    # we'd repeatedly re-apply updates on every entry and drift the state.
     vector_state_by_game: Dict[str, Any] = ctx.setdefault("vector_state_by_game", {})
-    state = vector_state_by_game.get(game_id)
+    bundle = vector_state_by_game.get(game_id)
+    if not isinstance(bundle, dict):
+        bundle = {}
+        vector_state_by_game[game_id] = bundle
+    state = bundle.get("state")
     if state is None:
         state = init_vector_state(players)
-        vector_state_by_game[game_id] = state
+        bundle["state"] = state
+        bundle["last_quest_updated"] = 0
+    last_q = int(bundle.get("last_quest_updated") or 0)
 
-    # Update vector memory from past quest transcripts & outcomes (< current quest)
-    for q in sorted(quests.keys()):
-        if int(q) >= int(target.quest):
-            continue
+    # Incremental updates from (last_q+1) up to (target.quest-1)
+    target_q = int(target.quest)
+    for q in range(last_q + 1, target_q):
         msgs = quests.get(int(q), [])
+        if not msgs:
+            continue
         update_from_transcript(state, players, msgs)
-        # Try to infer quest outcome from messages (best-effort). If not found, no-op.
-        # Supported keys: "quest_failed" or "success" in any msg dict.
-        quest_failed = None
-        for m in msgs:
-            if "quest_failed" in m:
-                quest_failed = bool(m.get("quest_failed"))
-            elif "success" in m:
-                quest_failed = not bool(m.get("success"))
-        # Team is also best-effort; if absent, skip outcome update.
-        team = []
-        for m in msgs:
-            if "team" in m and isinstance(m.get("team"), list):
-                team = [str(x) for x in m.get("team")]
+        team, quest_failed = parse_party_and_outcome_from_msgs(msgs)
         if team:
             update_from_quest_outcome(state, players, team, quest_failed)
+        bundle["last_quest_updated"] = q
 
-    vec_block = render_vector_memory(state, players)
+    vec_block = render_vector_memory(state, players, max_players=default_max_players())
+    vec_summary = summarize_state(state, players)
 
     # Base template prompt + retrieved memory (keeps your existing augmentation)
     base_prompt, meta = assemble_prompt_with_meta(target, retrieved, task_suffix="")
     prompt = base_prompt + "\n\n" + vec_block + "\n" + task_suffix
     meta["mode"] = "vector_memory"
     meta["vector_memory_preview"] = state_preview_json(state, players)
+    meta["vector_memory_summary"] = vec_summary
     return prompt, meta
 
 
@@ -289,6 +292,7 @@ def llm_post_typechat_role(
 
     openai_model: str = ctx.get("openai_model", "")
     openai_api_key: Optional[str] = ctx.get("openai_api_key")
+    llm_trace: Optional[List[Dict[str, Any]]] = ctx.get("llm_trace")
     base_role = extract_role_label(raw_pred, valid_roles)
     used_repair = False
     repair_attempted = False
@@ -308,7 +312,14 @@ def llm_post_typechat_role(
 
     if needs_repair and text:
         schema_hint_role = '{"role": "<ROLE>"}'
-        repaired_role = typechat_repair_to_json(text, schema_hint_role, openai_model, openai_api_key, True)
+        repaired_role = typechat_repair_to_json(
+            text,
+            schema_hint_role,
+            openai_model,
+            openai_api_key,
+            True,
+            trace=llm_trace,
+        )
         repair_attempted = True
         if isinstance(repaired_role, str):
             try:
@@ -340,6 +351,7 @@ def llm_post_typechat_beliefs(
 
     openai_model: str = ctx.get("openai_model", "")
     openai_api_key: Optional[str] = ctx.get("openai_api_key")
+    llm_trace: Optional[List[Dict[str, Any]]] = ctx.get("llm_trace")
     target: MemoryEntry = ctx["target"]
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
     game_players: Dict[str, List[str]] = ctx.get("game_players", {})
@@ -364,7 +376,14 @@ def llm_post_typechat_beliefs(
         else:
             inner = '"player-1": "<ROLE>", "player-2": "<ROLE>"'
         schema_hint = '{"beliefs": {' + inner + '}}'
-        repaired = typechat_repair_to_json(text, schema_hint, openai_model, openai_api_key, True)
+        repaired = typechat_repair_to_json(
+            text,
+            schema_hint,
+            openai_model,
+            openai_api_key,
+            True,
+            trace=llm_trace,
+        )
         repair_attempted = True
         if isinstance(repaired, str):
             try:
@@ -379,23 +398,45 @@ def llm_post_typechat_beliefs(
     pred_role = extract_role_label(raw_pred, valid_roles)
     if isinstance(beliefs_obj, dict):
         beliefs = belief_state_by_game[target.game_id]
+
+        def _normalize_belief_role(value: Any) -> str:
+            if value is None:
+                return "unknown"
+            s = str(value).strip()
+            if not s:
+                return "unknown"
+            if s.lower() == "unknown":
+                return "unknown"
+            # Map free-form / Avalon-style labels to the closest valid dataset role label.
+            mapped = extract_role_label(s, valid_roles)
+            return mapped if mapped is not None else "unknown"
+
         for p, r in beliefs_obj.items():
-            if isinstance(r, str):
-                beliefs[str(p)] = r.strip()
+            beliefs[str(p)] = _normalize_belief_role(r)
         try:
-            beliefs_preview = json.dumps({"beliefs": beliefs_obj})[:160]
+            # Preview normalized beliefs (what we actually store/use)
+            beliefs_preview = json.dumps({"beliefs": {str(p): beliefs.get(str(p), "unknown") for p in beliefs_obj.keys()}}, ensure_ascii=False)[:160]
         except Exception:
             beliefs_preview = None
         if isinstance(target.proposer, str):
             pr = beliefs.get(target.proposer)
-            if isinstance(pr, str) and any(pr.lower() == vr.lower() for vr in valid_roles):
-                pred_role = next(vr for vr in valid_roles if pr.lower() == vr.lower())
-                proposer_from_beliefs = pred_role
+            if isinstance(pr, str):
+                mapped_pr = extract_role_label(pr, valid_roles)
+                if mapped_pr is not None:
+                    pred_role = mapped_pr
+                    proposer_from_beliefs = mapped_pr
 
     # If still no pred_role, fallback to role repair
     if pred_role is None and text:
         schema_hint_role = '{"role": "<ROLE>"}'
-        repaired_role = typechat_repair_to_json(text, schema_hint_role, openai_model, openai_api_key, True)
+        repaired_role = typechat_repair_to_json(
+            text,
+            schema_hint_role,
+            openai_model,
+            openai_api_key,
+            True,
+            trace=llm_trace,
+        )
         pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
         if pr2 is not None and pred_role is None:
             used_repair = True
@@ -428,6 +469,8 @@ def evaluate_config(
     baseline_mode: str = "full_transcript",
     prompt_name: str = "mem_template",
     llm_fixer: str = "none",
+    save_llm_io: bool = False,
+    llm_io_max_chars: int = 0,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
 
@@ -492,6 +535,17 @@ def evaluate_config(
     fixer_total_calls: int = 0
     fixer_used_repair: int = 0
 
+    def _maybe_truncate(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        try:
+            limit = int(llm_io_max_chars)
+        except Exception:
+            limit = 0
+        if limit and len(text) > limit:
+            return text[:limit] + f"\n...<truncated {len(text) - limit} chars>"
+        return text
+
     for qi, target in enumerate(all_entries):
         q_vec = model.encode([target.text], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
         # Retrieve more than k for stability
@@ -545,7 +599,20 @@ def evaluate_config(
 
         # Optional LLM call (uses selected prompt depending on run mode)
         llm_prompt_to_use = prompt_base_task if bool(use_llm) and bool(llm_use_baseline_prompt) else prompt_mem_task
+        llm_trace: Optional[List[Dict[str, Any]]] = [] if (bool(use_llm) and bool(save_llm_io)) else None
         llm_out = llm_role_predict(llm_prompt_to_use, bool(use_llm), openai_model, openai_api_key)
+        if isinstance(llm_trace, list):
+            llm_trace.append(
+                {
+                    "kind": "predict",
+                    "provider": llm_out.get("provider"),
+                    "model": llm_out.get("model") or openai_model,
+                    "duration_s": llm_out.get("duration_s"),
+                    "prompt": _maybe_truncate(llm_prompt_to_use),
+                    "response": _maybe_truncate(llm_out.get("prediction")),
+                    "error": llm_out.get("error") or llm_out.get("note"),
+                }
+            )
 
         # Lightweight logging of LLM response and prompt length to monitor truncation/complaints
         if bool(use_llm):
@@ -563,7 +630,7 @@ def evaluate_config(
       warning: {warning}
       prediction_preview: {preview}
                 """.strip().format(
-                    game=gid,
+                    game=target.game_id,
                     quest=target.quest,
                     pchars=len(llm_prompt_to_use),
                     error=repr(err),
@@ -593,6 +660,7 @@ def evaluate_config(
                     "target": target,
                     "belief_state_by_game": belief_state_by_game,
                     "game_players": game_players,
+                    "llm_trace": llm_trace,
                 },
             )
             pred_role = post_out.get("pred_role")
@@ -637,7 +705,7 @@ def evaluate_config(
       beliefs_preview: {beliefs_preview}
                         """.strip()
                     ).format(
-                        game=gid,
+                        game=target.game_id,
                         quest=target.quest,
                         fixer=llm_fixer,
                         role=repr(pred_role),
@@ -658,7 +726,7 @@ def evaluate_config(
       used_repair: {used_repair}
                         """.strip()
                     ).format(
-                        game=gid,
+                        game=target.game_id,
                         quest=target.quest,
                         fixer=llm_fixer,
                         role=repr(pred_role),
@@ -676,6 +744,18 @@ def evaluate_config(
             "prompt_stats": pstats,
             "prompt_meta": {"with_memory": mem_meta, "baseline": base_meta},
             "llm": llm_out,
+            **(
+                {
+                    "llm_io": {
+                        "prompt_baseline": _maybe_truncate(prompt_base_task),
+                        "prompt_with_memory": _maybe_truncate(prompt_mem_task),
+                        "prompt_used": _maybe_truncate(llm_prompt_to_use) if bool(use_llm) else None,
+                        "interactions": llm_trace,
+                    }
+                }
+                if (bool(use_llm) and bool(save_llm_io))
+                else {}
+            ),
             "classification": {
                 "true_role": true_role,
                 "pred_role": pred_role,
@@ -808,6 +888,11 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--current_prompt", type=str, default="mem_template", help="Prompt strategy name for current (memory-augmented) run. Use 'none' to skip.")
     ap.add_argument("--llm_fixer", type=str, default="none", choices=list(LLM_POST_REGISTRY.keys()), help="How to post-process LLM JSON output (TypeChat repair, etc.).")
     ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary"], help="Named experiment preset. 'custom' uses provided arguments.")
+
+    # LLM logging / reproducibility
+    ap.add_argument("--save_llm_io", action="store_true", help="Save full LLM prompts/responses (including repair calls) into results JSON (large files)")
+    ap.add_argument("--no_save_llm_io", action="store_true", help="Do not save LLM prompts/responses into results JSON")
+    ap.add_argument("--llm_io_max_chars", type=int, default=0, help="Optional truncation limit for saved prompts/responses (0 = no truncation)")
     args = ap.parse_args(argv)
 
     # Apply performance flags to environment for downstream modules
@@ -852,6 +937,9 @@ def main(argv: List[str] | None = None) -> int:
     elif args.exp == "baseline_vs_template+summary":
         args.baseline_prompt = "baseline_full_transcript"
         args.current_prompt = "mem_template+summary"
+
+    # Default behavior: if using LLM, save IO unless explicitly disabled.
+    save_llm_io = bool(args.save_llm_io) or (bool(args.llm) and not bool(args.no_save_llm_io))
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
@@ -923,6 +1011,8 @@ def main(argv: List[str] | None = None) -> int:
                 baseline_mode="full_transcript",
                 prompt_name=args.baseline_prompt,
                 llm_fixer=args.llm_fixer,
+                save_llm_io=save_llm_io,
+                llm_io_max_chars=int(args.llm_io_max_chars),
             )
             agg_base_runs.append(agg_base_i)
             with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -945,6 +1035,8 @@ def main(argv: List[str] | None = None) -> int:
                 baseline_mode="full_transcript",
                 prompt_name=args.current_prompt,
                 llm_fixer=args.llm_fixer,
+                save_llm_io=save_llm_io,
+                llm_io_max_chars=int(args.llm_io_max_chars),
             )
             agg_cur_runs.append(agg_cur_i)
             with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
@@ -967,22 +1059,48 @@ def main(argv: List[str] | None = None) -> int:
 
     # Write F1 results as CSV (and keep txt for convenience)
     roles = sorted(set(list(agg_base.get("clf_by_role", {}).keys()) + list(agg_cur.get("clf_by_role", {}).keys())))
-    if roles:
+    has_base = bool(agg_base.get("clf_by_role"))
+    has_cur = bool(agg_cur.get("clf_by_role"))
+    if roles and (has_base or has_cur):
         # CSV
         import csv
+
         with (run_dir / "role_f1_table.csv").open("w", encoding="utf-8", newline="") as fcsv:
             writer = csv.writer(fcsv)
             writer.writerow(["approach", *roles, "micro_f1"])
-            writer.writerow(["baseline", *[f"{agg_base['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles], f"{agg_base.get('clf_micro_f1', 0.0):.3f}"])
-            if agg_cur.get("clf_by_role"):
-                writer.writerow(["current", *[f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles], f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"])
+            if has_base:
+                writer.writerow(
+                    [
+                        "baseline",
+                        *[f"{agg_base.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles],
+                        f"{agg_base.get('clf_micro_f1', 0.0):.3f}",
+                    ]
+                )
+            if has_cur:
+                writer.writerow(
+                    [
+                        "current",
+                        *[f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles],
+                        f"{agg_cur.get('clf_micro_f1', 0.0):.3f}",
+                    ]
+                )
+
         # TXT (tab-delimited)
         header = ["approach"] + roles + ["micro_f1"]
-        lines = ["\t".join(header)]
-        base_vals = ["baseline"] + [f"{agg_base['clf_by_role'].get(r, {}).get('f1', 0.0):.3f}" for r in roles] + [f"{agg_base.get('clf_micro_f1', 0.0):.3f}"]
-        content_lines = [*lines, "\t".join(base_vals)]
-        if agg_cur.get("clf_by_role"):
-            cur_vals = ["current"] + [f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles] + [f"{agg_cur.get('clf_micro_f1', 0.0):.3f}"]
+        content_lines = ["\t".join(header)]
+        if has_base:
+            base_vals = [
+                "baseline",
+                *[f"{agg_base.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles],
+                f"{agg_base.get('clf_micro_f1', 0.0):.3f}",
+            ]
+            content_lines.append("\t".join(base_vals))
+        if has_cur:
+            cur_vals = [
+                "current",
+                *[f"{agg_cur.get('clf_by_role', {}).get(r, {}).get('f1', 0.0):.3f}" for r in roles],
+                f"{agg_cur.get('clf_micro_f1', 0.0):.3f}",
+            ]
             content_lines.append("\t".join(cur_vals))
         (run_dir / "role_f1_table.txt").write_text("\n".join(content_lines) + "\n", encoding="utf-8")
 

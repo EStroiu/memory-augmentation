@@ -50,13 +50,32 @@ def assemble_belief_baseline_prompt(
     Follows the paper-style idea: provide compact global state + current belief
     vector b, then the current quest transcript, and ask for updated beliefs.
     """
-    roles_str = ", ".join(valid_roles) if valid_roles else "good, evil, merlin, unknown"
+    # Closed-set role list: we want the model to choose ONLY from these strings.
+    # Always allow "unknown" as an abstention value.
+    allowed_roles: List[str] = []
+    seen = set()
+    for r in (valid_roles or []):
+        rr = str(r).strip()
+        if not rr:
+            continue
+        key = rr.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        allowed_roles.append(rr)
+    if "unknown" not in seen:
+        allowed_roles.append("unknown")
+
+    roles_str = ", ".join(allowed_roles) if allowed_roles else "unknown"
     parts: List[str] = []
     parts.append("System: You are tracking hidden roles in an Avalon game.")
     parts.append(
         "Beliefs b = [b1, ..., b6] represent your current guess for each player's hidden role. "
-        "Each belief bi must be one of: {" + roles_str + "}."
+        "Each belief bi must be EXACTLY one of the allowed role strings listed below (case-sensitive)."
     )
+    parts.append("Allowed roles (closed set):")
+    for r in allowed_roles:
+        parts.append(f"- {r}")
     parts.append("")
     parts.append(f"Game id: {game_id}")
     parts.append("")
@@ -81,11 +100,20 @@ def assemble_belief_baseline_prompt(
         + roles_str
         + "}."
     )
+
+    # Use real player keys in the example when available (keeps the schema grounded)
+    example_pairs: List[str] = []
+    if players:
+        ex_roles = allowed_roles if allowed_roles else ["unknown"]
+        for i, p in enumerate(players[:2]):
+            example_pairs.append(f"\"{p}\": \"{ex_roles[min(i, len(ex_roles) - 1)]}\"")
+    else:
+        example_pairs = ["\"player-1\": \"unknown\"", "\"player-2\": \"unknown\""]
     parts.append(
         "Respond ONLY with a single JSON object of the form: "
-        "{\"beliefs\": {\"player-1\": \"good\", \"player-2\": \"unknown\", ...}}."
+        "{\"beliefs\": {" + ", ".join(example_pairs) + ", ...}}."
     )
-    parts.append("Do not include explanations or any extra keys.")
+    parts.append("Do not include explanations, prefixes, markdown, or extra keys.")
     return "\n".join(parts)
 
 
