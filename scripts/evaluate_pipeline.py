@@ -85,6 +85,8 @@ class ExperimentConfig:
 
     # LLM post-processing (registered in LLM_POST_REGISTRY)
     llm_fixer: str = "none"  # e.g. "none", "typechat_role", "typechat_beliefs"
+    llm_fixer_baseline: Optional[str] = None
+    llm_fixer_current: Optional[str] = None
 
     # Human-readable name for output folder naming
     experiment_name: str = "custom"
@@ -887,6 +889,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--baseline_prompt", type=str, default="baseline_full_transcript", help="Prompt strategy name for baseline (see README for options). Use 'none' to skip.")
     ap.add_argument("--current_prompt", type=str, default="mem_template", help="Prompt strategy name for current (memory-augmented) run. Use 'none' to skip.")
     ap.add_argument("--llm_fixer", type=str, default="none", choices=list(LLM_POST_REGISTRY.keys()), help="How to post-process LLM JSON output (TypeChat repair, etc.).")
+    ap.add_argument("--llm_fixer_baseline", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional baseline-only LLM fixer (overrides --llm_fixer for baseline).")
+    ap.add_argument("--llm_fixer_current", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional current-only LLM fixer (overrides --llm_fixer for current).")
     ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary"], help="Named experiment preset. 'custom' uses provided arguments.")
 
     # LLM logging / reproducibility
@@ -1010,7 +1014,7 @@ def main(argv: List[str] | None = None) -> int:
                 llm_use_baseline_prompt=True,
                 baseline_mode="full_transcript",
                 prompt_name=args.baseline_prompt,
-                llm_fixer=args.llm_fixer,
+                llm_fixer=(args.llm_fixer_baseline or args.llm_fixer),
                 save_llm_io=save_llm_io,
                 llm_io_max_chars=int(args.llm_io_max_chars),
             )
@@ -1034,7 +1038,7 @@ def main(argv: List[str] | None = None) -> int:
                 llm_use_baseline_prompt=False,
                 baseline_mode="full_transcript",
                 prompt_name=args.current_prompt,
-                llm_fixer=args.llm_fixer,
+                llm_fixer=(args.llm_fixer_current or args.llm_fixer),
                 save_llm_io=save_llm_io,
                 llm_io_max_chars=int(args.llm_io_max_chars),
             )
