@@ -3,11 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import numpy as np
-from scripts.metrics_utils import viz_confusion_matrix
+import plotly.graph_objects as go  # type: ignore
+from plotly.offline import plot as plotly_offline_plot
+
+try:
+    from scripts.metrics_utils import viz_confusion_matrix
+except ModuleNotFoundError:
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from scripts.metrics_utils import viz_confusion_matrix
 
 @dataclass
 class ClassifiedExample:
@@ -19,6 +29,8 @@ class ClassifiedExample:
     prompt_stats: Dict[str, Any]
     llm_raw: Dict[str, Any]
     target: Dict[str, Any]
+    vector_memory: Dict[str, Any]
+    llm_processed: Dict[str, Any]
 
 
 def load_results(run_dir: Path, which: str = "current") -> List[ClassifiedExample]:
@@ -49,6 +61,8 @@ def load_results(run_dir: Path, which: str = "current") -> List[ClassifiedExampl
                 prompt_stats=r.get("prompt_stats", {}),
                 llm_raw=r.get("llm", {}),
                 target=target,
+                vector_memory=r.get("vector_memory", {}) or {},
+                llm_processed=r.get("llm_processed", {}) or {},
             )
         )
     return examples
@@ -325,6 +339,338 @@ def summarize_memory_effect(pairs: List[Tuple[ClassifiedExample, ClassifiedExamp
         print(f"  net helpful (helpful - harmful): {net} (changed preds: {changed_pred})")
 
 
+def summarize_belief_effect(
+    pairs: List[Tuple[ClassifiedExample, ClassifiedExample]],
+    max_examples: int = 5,
+) -> None:
+    """Summarize how belief/vector memory correlates with prediction changes.
+
+    Prints a brief delta summary and a few illustrative examples with
+    baseline vs current predictions and any vector-memory preview available.
+    """
+    if not pairs:
+        print("No paired baseline/current examples found; did you run both modes?")
+        return
+
+    changed = 0
+    helpful = 0
+    harmful = 0
+    for b, c in pairs:
+        if b.true_role is None or c.true_role is None:
+            continue
+        if b.pred_role != c.pred_role:
+            changed += 1
+        base_ok = b.pred_role == b.true_role
+        cur_ok = c.pred_role == c.true_role
+        if (not base_ok) and cur_ok:
+            helpful += 1
+        elif base_ok and (not cur_ok):
+            harmful += 1
+
+    total = helpful + harmful
+    print("Belief/vector-memory effect summary:")
+    print(f"  changed predictions: {changed}")
+    print(f"  helpful changes    : {helpful}")
+    print(f"  harmful changes    : {harmful}")
+    if total > 0:
+        net = helpful - harmful
+        print(f"  net helpful        : {net}")
+
+    print("\nExamples with vector-memory preview (if available):")
+    shown = 0
+    for b, c in pairs:
+        if shown >= max_examples:
+            break
+        if b.true_role is None or c.true_role is None:
+            continue
+        # prioritize cases where prediction changes
+        if b.pred_role == c.pred_role:
+            continue
+        vm_preview = c.vector_memory.get("preview") if isinstance(c.vector_memory, dict) else None
+        print("-" * 80)
+        print(f"game_id: {c.game_id}  quest: {c.quest}")
+        print(f"true_role: {c.true_role}")
+        print(f"baseline_pred: {b.pred_role}  current_pred: {c.pred_role}")
+        if vm_preview:
+            print(f"vector_memory_preview: {vm_preview}")
+        else:
+            print("vector_memory_preview: <none>")
+        shown += 1
+
+
+def _find_experiment_dir(path: Path) -> Path:
+    """Resolve an experiment directory that contains a `runs/` folder.
+
+    Accepts either:
+    - experiment directory (`.../outputs/eval/<exp_id>`)
+    - runs directory (`.../outputs/eval/<exp_id>/runs`)
+    - single run directory (`.../outputs/eval/<exp_id>/runs/run_1`)
+    """
+    p = path.resolve()
+    if (p / "runs").exists():
+        return p
+    if p.name == "runs" and p.parent.exists():
+        return p.parent
+    if p.name.startswith("run_") and p.parent.name == "runs" and p.parent.parent.exists():
+        return p.parent.parent
+    raise FileNotFoundError(f"Could not resolve experiment dir with runs/: {path}")
+
+
+def _find_single_run_dir(path: Path) -> Path:
+    """Resolve a single `run_*` directory from experiment/runs/run input."""
+    p = path.resolve()
+    if p.name.startswith("run_") and p.is_dir():
+        return p
+    exp_dir = _find_experiment_dir(p)
+    runs_dir = exp_dir / "runs"
+    if not runs_dir.exists():
+        raise FileNotFoundError(f"No runs directory found under: {exp_dir}")
+    run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")])
+    if not run_dirs:
+        raise FileNotFoundError(f"No run_* subdirectories found under: {runs_dir}")
+    return run_dirs[0]
+
+
+def _collect_metric_from_runs(experiment_dir: Path, which: str, metric: str) -> List[float]:
+    runs_dir = experiment_dir / "runs"
+    if not runs_dir.exists():
+        return []
+    values: List[float] = []
+    for run_subdir in sorted(runs_dir.iterdir()):
+        if not run_subdir.is_dir() or not run_subdir.name.startswith("run_"):
+            continue
+        agg_path = run_subdir / f"aggregate_{which}.json"
+        if not agg_path.exists():
+            continue
+        try:
+            with agg_path.open("r", encoding="utf-8") as f:
+                agg = json.load(f)
+            val = agg.get(metric)
+            if val is None:
+                continue
+            values.append(float(val))
+        except Exception:
+            continue
+    return values
+
+
+def _collect_role_metric_from_runs(
+    experiment_dir: Path,
+    which: str,
+    role_metric: str,
+) -> Dict[str, List[float]]:
+    """Collect per-role metric arrays from per-run aggregate files.
+
+    Returns a mapping role -> list of metric values across runs.
+    """
+    runs_dir = experiment_dir / "runs"
+    out: Dict[str, List[float]] = {}
+    if not runs_dir.exists():
+        return out
+    for run_subdir in sorted(runs_dir.iterdir()):
+        if not run_subdir.is_dir() or not run_subdir.name.startswith("run_"):
+            continue
+        agg_path = run_subdir / f"aggregate_{which}.json"
+        if not agg_path.exists():
+            continue
+        try:
+            with agg_path.open("r", encoding="utf-8") as f:
+                agg = json.load(f)
+            by_role = agg.get("clf_by_role", {}) or {}
+            for role, m in by_role.items():
+                if not isinstance(m, dict):
+                    continue
+                val = m.get(role_metric)
+                if val is None:
+                    continue
+                out.setdefault(str(role), []).append(float(val))
+        except Exception:
+            continue
+    return out
+
+
+def plot_baseline_vs_current_performance(
+    experiment_dir: Path,
+    metric: str = "clf_micro_f1",
+    out_html: str = "performance_compare.html",
+) -> None:
+    """Plot current vs baseline mean performance with std-dev error bars.
+
+    The plot is built from per-run aggregate files under `runs/run_*/aggregate_*.json`.
+    If baseline files are absent, the chart will include only current.
+    """
+    current_vals = _collect_metric_from_runs(experiment_dir, which="current", metric=metric)
+    baseline_vals = _collect_metric_from_runs(experiment_dir, which="baseline", metric=metric)
+
+    if not current_vals and not baseline_vals:
+        print(
+            "No run-level metrics found for plotting. "
+            f"Expected files like runs/run_*/aggregate_current.json with key '{metric}'."
+        )
+        return
+
+    labels: List[str] = []
+    means: List[float] = []
+    stds: List[float] = []
+    counts: List[int] = []
+
+    if baseline_vals:
+        labels.append("baseline")
+        means.append(float(np.mean(baseline_vals)))
+        stds.append(float(np.std(baseline_vals)))
+        counts.append(len(baseline_vals))
+    if current_vals:
+        labels.append("current")
+        means.append(float(np.mean(current_vals)))
+        stds.append(float(np.std(current_vals)))
+        counts.append(len(current_vals))
+
+    text = [f"N={n}<br>mean={m:.4f}<br>std={s:.4f}" for n, m, s in zip(counts, means, stds)]
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=labels,
+                y=means,
+                error_y=dict(type="data", array=stds, visible=True),
+                text=text,
+                textposition="outside",
+                hovertemplate="%{x}<br>mean=%{y:.4f}<br>%{text}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=f"Baseline vs current performance ({metric})",
+        xaxis_title="Condition",
+        yaxis_title=metric,
+        yaxis=dict(range=[0.0, 1.0]),
+    )
+
+    out_path = experiment_dir / out_html
+    plotly_offline_plot(fig, filename=str(out_path), auto_open=False, include_plotlyjs="cdn")
+    print(f"Saved performance comparison plot to: {out_path}")
+    for label, n, m, s in zip(labels, counts, means, stds):
+        print(f"  {label:>8}: N={n:>3d} mean={m:.6f} std={s:.6f}")
+
+
+def plot_baseline_vs_current_role_performance(
+    experiment_dir: Path,
+    role_metric: str = "f1",
+    out_html: str = "performance_compare_roles.html",
+) -> None:
+    """Plot per-role baseline vs current with std-dev error bars across runs."""
+    baseline_map = _collect_role_metric_from_runs(experiment_dir, which="baseline", role_metric=role_metric)
+    current_map = _collect_role_metric_from_runs(experiment_dir, which="current", role_metric=role_metric)
+
+    roles = sorted(set(baseline_map.keys()) | set(current_map.keys()))
+    if not roles:
+        print(
+            "No role-level metrics found for plotting. "
+            "Expected clf_by_role in runs/run_*/aggregate_{baseline,current}.json."
+        )
+        return
+
+    baseline_means = [float(np.mean(baseline_map.get(r, [0.0]))) for r in roles]
+    baseline_stds = [float(np.std(baseline_map.get(r, [0.0]))) for r in roles]
+    current_means = [float(np.mean(current_map.get(r, [0.0]))) for r in roles]
+    current_stds = [float(np.std(current_map.get(r, [0.0]))) for r in roles]
+
+    baseline_text = [
+        f"N={len(baseline_map.get(r, []))}<br>mean={m:.4f}<br>std={s:.4f}"
+        for r, m, s in zip(roles, baseline_means, baseline_stds)
+    ]
+    current_text = [
+        f"N={len(current_map.get(r, []))}<br>mean={m:.4f}<br>std={s:.4f}"
+        for r, m, s in zip(roles, current_means, current_stds)
+    ]
+
+    fig = go.Figure()
+    if any(len(baseline_map.get(r, [])) > 0 for r in roles):
+        fig.add_trace(
+            go.Bar(
+                name="baseline",
+                x=roles,
+                y=baseline_means,
+                error_y=dict(type="data", array=baseline_stds, visible=True),
+                text=baseline_text,
+                hovertemplate="role=%{x}<br>baseline mean=%{y:.4f}<br>%{text}<extra></extra>",
+            )
+        )
+    if any(len(current_map.get(r, [])) > 0 for r in roles):
+        fig.add_trace(
+            go.Bar(
+                name="current",
+                x=roles,
+                y=current_means,
+                error_y=dict(type="data", array=current_stds, visible=True),
+                text=current_text,
+                hovertemplate="role=%{x}<br>current mean=%{y:.4f}<br>%{text}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=f"Per-role baseline vs current ({role_metric})",
+        barmode="group",
+        xaxis_title="Role",
+        yaxis_title=role_metric,
+        yaxis=dict(range=[0.0, 1.0]),
+    )
+
+    out_path = experiment_dir / out_html
+    plotly_offline_plot(fig, filename=str(out_path), auto_open=False, include_plotlyjs="cdn")
+    print(f"Saved per-role performance comparison plot to: {out_path}")
+
+
+def run_full_explainability(
+    run_dir: Path,
+    which: str,
+    top_n: int,
+    max_examples: int,
+    heatmap_html: str,
+    use_memory: bool,
+    compare_metric: str,
+    compare_html: str,
+    compare_roles_html: str,
+    role_metric: str,
+) -> None:
+    """Run a complete explainability pass for one run + experiment-level comparison."""
+    examples = load_results(run_dir, which=which)
+    counts = build_confusion_counts(examples)
+
+    print("\n=== Top confusions ===")
+    print_top_confusions(counts, top_n)
+
+    print("\n=== Role metrics ===")
+    metrics = compute_role_metrics(examples)
+    print_role_metrics(metrics)
+
+    print("\n=== Accuracy vs prompt length ===")
+    accuracy_vs_prompt_length(examples, use_memory=use_memory)
+
+    print("\n=== Accuracy by quest bucket ===")
+    accuracy_by_quest_bucket(examples)
+
+    print("\n=== Paired baseline/current comparison ===")
+    pairs = load_paired(run_dir)
+    summarize_memory_effect(pairs)
+
+    print("\n=== Belief/vector memory effect ===")
+    summarize_belief_effect(pairs, max_examples=max_examples)
+
+    print("\n=== Confusion heatmap ===")
+    viz_confusion_heatmap(counts, run_dir / heatmap_html)
+
+    print("\n=== Baseline vs current performance plot (error bars) ===")
+    experiment_dir = _find_experiment_dir(run_dir)
+    plot_baseline_vs_current_performance(experiment_dir, metric=compare_metric, out_html=compare_html)
+
+    print("\n=== Per-role baseline vs current plot (error bars) ===")
+    plot_baseline_vs_current_role_performance(
+        experiment_dir,
+        role_metric=role_metric,
+        out_html=compare_roles_html,
+    )
+
+
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Explainability analysis for LLM proposer-role predictions.")
     ap.add_argument("--run_dir", type=str, required=True, help="Path to a single run directory (e.g., outputs/eval/.../runs/run_1)")
@@ -341,6 +687,10 @@ def main(argv: List[str] | None = None) -> int:
             "prompt_length",
             "quest_buckets",
             "compare_baseline",
+            "compare_beliefs",
+            "compare_performance_plot",
+            "compare_role_performance_plot",
+            "full_eval",
         ],
         help="What to compute/visualize.",
     )
@@ -350,12 +700,83 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--max_examples", type=int, default=5, help="Maximum number of examples to show (examples mode).")
     ap.add_argument("--heatmap_html", type=str, default="confusion_explain.html", help="Output HTML filename for heatmap (heatmap mode).")
     ap.add_argument("--use_memory", action="store_true", help="In prompt_length mode, analyze with_memory prompts instead of baseline.")
+    ap.add_argument(
+        "--compare_metric",
+        type=str,
+        default="clf_micro_f1",
+        help="Metric key to compare in compare_performance_plot/full_eval (read from aggregate_*.json).",
+    )
+    ap.add_argument(
+        "--compare_html",
+        type=str,
+        default="performance_compare.html",
+        help="Output HTML filename for compare_performance_plot/full_eval.",
+    )
+    ap.add_argument(
+        "--role_metric",
+        type=str,
+        default="f1",
+        choices=["f1", "precision", "recall"],
+        help="Per-role metric to plot in compare_role_performance_plot/full_eval.",
+    )
+    ap.add_argument(
+        "--compare_roles_html",
+        type=str,
+        default="performance_compare_roles.html",
+        help="Output HTML filename for compare_role_performance_plot/full_eval.",
+    )
     args = ap.parse_args(argv)
 
     run_dir = Path(args.run_dir)
     if not run_dir.exists():
         print(f"Run dir not found: {run_dir}")
         return 1
+
+    if args.mode == "compare_performance_plot":
+        try:
+            experiment_dir = _find_experiment_dir(run_dir)
+        except Exception as e:
+            print(f"Failed to resolve experiment dir: {e}")
+            return 1
+        plot_baseline_vs_current_performance(
+            experiment_dir,
+            metric=str(args.compare_metric),
+            out_html=str(args.compare_html),
+        )
+        return 0
+
+    if args.mode == "compare_role_performance_plot":
+        try:
+            experiment_dir = _find_experiment_dir(run_dir)
+        except Exception as e:
+            print(f"Failed to resolve experiment dir: {e}")
+            return 1
+        plot_baseline_vs_current_role_performance(
+            experiment_dir,
+            role_metric=str(args.role_metric),
+            out_html=str(args.compare_roles_html),
+        )
+        return 0
+
+    if args.mode == "full_eval":
+        try:
+            selected_run_dir = _find_single_run_dir(run_dir)
+        except Exception as e:
+            print(f"Failed to resolve run directory for full_eval: {e}")
+            return 1
+        run_full_explainability(
+            run_dir=selected_run_dir,
+            which=str(args.which),
+            top_n=int(args.top_n),
+            max_examples=int(args.max_examples),
+            heatmap_html=str(args.heatmap_html),
+            use_memory=bool(args.use_memory),
+            compare_metric=str(args.compare_metric),
+            compare_html=str(args.compare_html),
+            compare_roles_html=str(args.compare_roles_html),
+            role_metric=str(args.role_metric),
+        )
+        return 0
 
     try:
         examples = load_results(run_dir, which=str(args.which))
@@ -387,6 +808,9 @@ def main(argv: List[str] | None = None) -> int:
     elif args.mode == "compare_baseline":
         pairs = load_paired(run_dir)
         summarize_memory_effect(pairs)
+    elif args.mode == "compare_beliefs":
+        pairs = load_paired(run_dir)
+        summarize_belief_effect(pairs, max_examples=int(args.max_examples))
 
     return 0
 
