@@ -128,7 +128,13 @@ def render_vector_memory(state: VectorState, players: List[str], max_players: in
         if p not in ordered:
             ordered.append(p)
 
-    lines = ["VECTOR_MEMORY (per player)"]
+    lines = [
+        "VECTOR_MEMORY (per player)",
+        "Heuristics used to compute this memory:",
+        "- p_evil starts at 0.50 for each player.",
+        "- After each completed quest: team members update by outcome (fail increases suspicion; success decreases suspicion).",
+        "- talk is an exponential moving average of each player's message share in quest chat.",
+    ]
     for p in ordered[:max_players]:
         pv = state[p]
         lines.append(

@@ -591,6 +591,24 @@ def evaluate_config(
 
         llm_prompt_text, prompt_meta = prompt_fn(target, retrieved_pairs, ctx)
 
+        # Explicit, machine-friendly heuristic provenance for downstream analysis.
+        retrieved_with_summary_count = sum(
+            1 for e, _ in retrieved_pairs if isinstance(e.text, str) and "HEURISTIC SUMMARY:" in e.text
+        )
+        strategy_mode = str((prompt_meta or {}).get("mode", "")) if isinstance(prompt_meta, dict) else ""
+        heuristics_info: Dict[str, Any] = {
+            "prompt_strategy": prompt_name,
+            "strategy_mode": strategy_mode or prompt_name,
+            "memory_format": memory_format,
+            "template_summary_enabled": memory_format == "template+summary",
+            "retrieved_count": len(retrieved_pairs),
+            "retrieved_with_heuristic_summary_count": int(retrieved_with_summary_count),
+            "vector_memory_enabled": strategy_mode == "vector_memory",
+            "vector_memory_heuristics_explained_in_prompt": "Heuristics used to compute this memory:" in llm_prompt_text,
+            "task_schema_enforced": True,
+            "task_schema": '{"role": "<ROLE>"}',
+        }
+
         # For backwards-compatible stats, treat this single prompt as both baseline and with-memory.
         prompt_base_task = llm_prompt_text
         prompt_mem_task = llm_prompt_text
@@ -622,19 +640,28 @@ def evaluate_config(
             preview = preview_raw.replace("\n", " ")[:160]
             err = llm_out.get("error") or llm_out.get("note")
             warn = llm_out.get("warning") or llm_out.get("truncated")
-            # Clearer, aligned multi-line log for readability
+            # Clear, stable single-line logs for easier grep/analysis.
             print(
-                """
-    [llm]
-      game: {game}  quest: {quest}
-      prompt_chars: {pchars}
-      error: {error}
-      warning: {warning}
-      prediction_preview: {preview}
-                """.strip().format(
+                (
+                    "[entry] game={game} quest={quest} strategy={strategy} mode={mode} "
+                    "memory_format={memory_format} prompt_chars={pchars} "
+                    "heur_summary={heur_count}/{retrieved} vector_heuristics_shown={vec_heur}"
+                ).format(
                     game=target.game_id,
                     quest=target.quest,
+                    strategy=prompt_name,
+                    mode=heuristics_info.get("strategy_mode"),
+                    memory_format=memory_format,
                     pchars=len(llm_prompt_to_use),
+                    heur_count=heuristics_info.get("retrieved_with_heuristic_summary_count", 0),
+                    retrieved=heuristics_info.get("retrieved_count", 0),
+                    vec_heur=heuristics_info.get("vector_memory_heuristics_explained_in_prompt", False),
+                )
+            )
+            print(
+                "[llm] game={game} quest={quest} error={error} warning={warning} prediction_preview={preview}".format(
+                    game=target.game_id,
+                    quest=target.quest,
                     error=repr(err),
                     warning=repr(warn),
                     preview=repr(preview),
@@ -745,6 +772,7 @@ def evaluate_config(
             "memory_format": memory_format,
             "prompt_stats": pstats,
             "prompt_meta": {"with_memory": mem_meta, "baseline": base_meta},
+            "heuristics": heuristics_info,
             "llm": llm_out,
             **(
                 {
@@ -759,6 +787,24 @@ def evaluate_config(
                 else {}
             ),
             "classification": {
+                "true_role": true_role,
+                "pred_role": pred_role,
+            },
+            "log_row": {
+                "game_id": target.game_id,
+                "quest": int(target.quest),
+                "entry_id": target.entry_id,
+                "prompt_strategy": prompt_name,
+                "strategy_mode": heuristics_info.get("strategy_mode"),
+                "memory_format": memory_format,
+                "retrieved_count": heuristics_info.get("retrieved_count"),
+                "retrieved_with_heuristic_summary_count": heuristics_info.get("retrieved_with_heuristic_summary_count"),
+                "vector_memory_enabled": heuristics_info.get("vector_memory_enabled"),
+                "vector_memory_heuristics_explained_in_prompt": heuristics_info.get("vector_memory_heuristics_explained_in_prompt"),
+                "prompt_chars": len(llm_prompt_to_use),
+                "llm_error": llm_out.get("error") or llm_out.get("note"),
+                "llm_warning": llm_out.get("warning") or llm_out.get("truncated"),
+                "llm_duration_s": llm_out.get("duration_s"),
                 "true_role": true_role,
                 "pred_role": pred_role,
             },
@@ -815,6 +861,35 @@ def evaluate_config(
         },
     }
 
+    heuristic_usage = {
+        "prompt_strategy": prompt_name,
+        "memory_format": memory_format,
+        "template_summary_enabled": memory_format == "template+summary",
+        "vector_memory_enabled": prompt_name == "vector_memory",
+        "avg_retrieved_with_heuristic_summary": (
+            float(np.mean([r.get("heuristics", {}).get("retrieved_with_heuristic_summary_count", 0) for r in results]))
+            if results
+            else 0.0
+        ),
+        "avg_retrieved_count": (
+            float(np.mean([r.get("heuristics", {}).get("retrieved_count", 0) for r in results]))
+            if results
+            else 0.0
+        ),
+        "vector_memory_heuristics_explained_rate": (
+            float(
+                np.mean(
+                    [
+                        1.0 if r.get("heuristics", {}).get("vector_memory_heuristics_explained_in_prompt") else 0.0
+                        for r in results
+                    ]
+                )
+            )
+            if results
+            else 0.0
+        ),
+    }
+
     # Classification metrics (per-role F1 and micro-F1)
     roles_sorted = sorted(roles_seen)
     clf_by_role: Dict[str, Dict[str, float]] = {}
@@ -849,6 +924,7 @@ def evaluate_config(
         "memory_format": memory_format,
         "model": model_name,
         "avg_prompt_sizes": avg_prompt_sizes,
+        "heuristic_usage": heuristic_usage,
         "clf_by_role": clf_by_role,
         "clf_micro_f1": micro_f1,
         "clf_confusion": {tr: dict(prs) for tr, prs in conf_counts.items()},
