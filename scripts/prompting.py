@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import re
 from typing import Any, Dict, List, Tuple
-from scripts.template_summary import MemoryEntry, heuristic_summary
+from scripts.template_summary import MemoryEntry
+from scripts.belief_vector import build_belief_vector_prompt
 
 # ---------- Basic prompt assembly ----------
 
@@ -45,76 +45,15 @@ def assemble_belief_baseline_prompt(
     current_transcript: str,
     valid_roles: List[str],
 ) -> str:
-    """Iterative belief-vector baseline prompt.
-
-    Follows the paper-style idea: provide compact global state + current belief
-    vector b, then the current quest transcript, and ask for updated beliefs.
-    """
-    # Closed-set role list: we want the model to choose ONLY from these strings.
-    # Always allow "unknown" as an abstention value.
-    allowed_roles: List[str] = []
-    seen = set()
-    for r in (valid_roles or []):
-        rr = str(r).strip()
-        if not rr:
-            continue
-        key = rr.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        allowed_roles.append(rr)
-    if "unknown" not in seen:
-        allowed_roles.append("unknown")
-
-    roles_str = ", ".join(allowed_roles) if allowed_roles else "unknown"
-    parts: List[str] = []
-    parts.append("System: You are tracking hidden roles in an Avalon game.")
-    parts.append(
-        "Beliefs b = [b1, ..., b6] represent your current guess for each player's hidden role. "
-        "Each belief bi must be EXACTLY one of the allowed role strings listed below (case-sensitive)."
+    return build_belief_vector_prompt(
+        game_id=game_id,
+        players=players,
+        belief_vector=belief_vector,
+        past_state_lines=past_state_lines,
+        current_quest=current_quest,
+        current_transcript=current_transcript,
+        valid_roles=valid_roles,
     )
-    parts.append("Allowed roles (closed set):")
-    for r in allowed_roles:
-        parts.append(f"- {r}")
-    parts.append("")
-    parts.append(f"Game id: {game_id}")
-    parts.append("")
-    parts.append("Global state so far (completed quests):")
-    if past_state_lines:
-        parts.extend(past_state_lines)
-    else:
-        parts.append("(no completed quests yet)")
-    parts.append("")
-    parts.append("Current beliefs b:")
-    for p in players:
-        role = belief_vector.get(p, "unknown")
-        parts.append(f"- {p}: {role}")
-    parts.append("")
-    parts.append(f"Current quest: {current_quest}")
-    parts.append("Quest transcript (only this round's chat):")
-    parts.append(current_transcript or "(no player messages)")
-    parts.append("")
-    parts.append(
-        "Task: Update the belief vector b_next after seeing this quest. "
-        "Return an updated belief for every player in the same order, using only the roles {"
-        + roles_str
-        + "}."
-    )
-
-    # Use real player keys in the example when available (keeps the schema grounded)
-    example_pairs: List[str] = []
-    if players:
-        ex_roles = allowed_roles if allowed_roles else ["unknown"]
-        for i, p in enumerate(players[:2]):
-            example_pairs.append(f"\"{p}\": \"{ex_roles[min(i, len(ex_roles) - 1)]}\"")
-    else:
-        example_pairs = ["\"player-1\": \"unknown\"", "\"player-2\": \"unknown\""]
-    parts.append(
-        "Respond ONLY with a single JSON object of the form: "
-        "{\"beliefs\": {" + ", ".join(example_pairs) + ", ...}}."
-    )
-    parts.append("Do not include explanations, prefixes, markdown, or extra keys.")
-    return "\n".join(parts)
 
 
 def prompt_stats(prompt_with_memory: str, prompt_baseline: str) -> Dict[str, Dict[str, int]]:

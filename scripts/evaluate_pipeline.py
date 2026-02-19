@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from collections import defaultdict
@@ -43,8 +42,12 @@ from scripts.json_utils import (
 from scripts.prompting import (
     assemble_prompt_with_meta,
     assemble_baseline_prompt_with_meta,
-    assemble_belief_baseline_prompt,
     prompt_stats,
+)
+from scripts.belief_vector import (
+    ensure_belief_state_for_game,
+    build_belief_vector_prompt,
+    apply_belief_updates,
 )
 
 from scripts.vector_memory import (
@@ -158,10 +161,7 @@ def prompt_belief_vector(
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
     valid_roles: List[str] = ctx["valid_roles"]
 
-    # Ensure stable belief state dict for this game
-    beliefs = belief_state_by_game[game_id]
-    for p in players:
-        beliefs.setdefault(p, "unknown")
+    beliefs = ensure_belief_state_for_game(belief_state_by_game, game_id, players)
 
     # Past state lines for quests < current quest
     past_state_lines: List[str] = []
@@ -172,7 +172,7 @@ def prompt_belief_vector(
     current_msgs = quests.get(int(target.quest), [])
     current_transcript = quest_transcript_only(current_msgs)
 
-    prompt = assemble_belief_baseline_prompt(
+    prompt = build_belief_vector_prompt(
         game_id=game_id,
         players=players,
         belief_vector=beliefs,
@@ -399,22 +399,9 @@ def llm_post_typechat_beliefs(
 
     pred_role = extract_role_label(raw_pred, valid_roles)
     if isinstance(beliefs_obj, dict):
-        beliefs = belief_state_by_game[target.game_id]
-
-        def _normalize_belief_role(value: Any) -> str:
-            if value is None:
-                return "unknown"
-            s = str(value).strip()
-            if not s:
-                return "unknown"
-            if s.lower() == "unknown":
-                return "unknown"
-            # Map free-form / Avalon-style labels to the closest valid dataset role label.
-            mapped = extract_role_label(s, valid_roles)
-            return mapped if mapped is not None else "unknown"
-
-        for p, r in beliefs_obj.items():
-            beliefs[str(p)] = _normalize_belief_role(r)
+        players = game_players.get(target.game_id, [])
+        beliefs = ensure_belief_state_for_game(belief_state_by_game, target.game_id, players)
+        apply_belief_updates(beliefs, beliefs_obj, valid_roles)
         try:
             # Preview normalized beliefs (what we actually store/use)
             beliefs_preview = json.dumps({"beliefs": {str(p): beliefs.get(str(p), "unknown") for p in beliefs_obj.keys()}}, ensure_ascii=False)[:160]
@@ -468,7 +455,6 @@ def evaluate_config(
     openai_model: str,
     openai_api_key: str | None,
     llm_use_baseline_prompt: bool,
-    baseline_mode: str = "full_transcript",
     prompt_name: str = "mem_template",
     llm_fixer: str = "none",
     save_llm_io: bool = False,
@@ -1088,7 +1074,6 @@ def main(argv: List[str] | None = None) -> int:
                 openai_model=args.llm_model,
                 openai_api_key=args.openai_api_key,
                 llm_use_baseline_prompt=True,
-                baseline_mode="full_transcript",
                 prompt_name=args.baseline_prompt,
                 llm_fixer=(args.llm_fixer_baseline or args.llm_fixer),
                 save_llm_io=save_llm_io,
@@ -1112,7 +1097,6 @@ def main(argv: List[str] | None = None) -> int:
                 openai_model=args.llm_model,
                 openai_api_key=args.openai_api_key,
                 llm_use_baseline_prompt=False,
-                baseline_mode="full_transcript",
                 prompt_name=args.current_prompt,
                 llm_fixer=(args.llm_fixer_current or args.llm_fixer),
                 save_llm_io=save_llm_io,
