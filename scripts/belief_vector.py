@@ -101,6 +101,7 @@ def build_belief_vector_prompt(
     current_quest: int,
     current_transcript: str,
     valid_roles: List[str],
+    social_cues: str = "",
 ) -> str:
     """Build a closed-set belief-update prompt for the current quest."""
     allowed_roles: List[str] = []
@@ -145,6 +146,9 @@ def build_belief_vector_prompt(
     lines.append("Quest transcript (only this round's chat):")
     lines.append(current_transcript or "(no player messages)")
     lines.append("")
+    if social_cues.strip():
+        lines.append(social_cues.strip())
+        lines.append("")
     lines.append(
         "Task: Update the belief vector b_next after seeing this quest. "
         "Return an updated belief for every player in the same order, using only the roles {"

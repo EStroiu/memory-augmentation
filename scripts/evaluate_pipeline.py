@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -136,6 +136,133 @@ def register_llm_post(name: str) -> Callable[[LLMPostProcessor], LLMPostProcesso
     return _wrap
 
 
+def _parse_vote_map(vote_outcome_line: str) -> Dict[str, str]:
+    """Parse 'party vote outcome: p1: yes, p2: no' into a map."""
+    vote_map: Dict[str, str] = {}
+    if not isinstance(vote_outcome_line, str):
+        return vote_map
+    try:
+        raw = vote_outcome_line.replace("party vote outcome:", "", 1).strip()
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        for part in parts:
+            if ":" not in part:
+                continue
+            name, vote = part.split(":", 1)
+            vote_map[str(name).strip()] = str(vote).strip().lower()
+    except Exception:
+        return {}
+    return vote_map
+
+
+def _social_deduction_memory(
+    game_id: str,
+    target_quest: int,
+    quests: Dict[int, List[Dict[str, Any]]],
+    players: List[str],
+) -> Tuple[str, Dict[str, Any]]:
+    """Build compact social-deduction cues from past quests only.
+
+    Captures coalition behavior, vote alignment on failed quests, and
+    contradiction flips in player-to-player stances.
+    """
+    pset = {str(p) for p in players}
+    team_fail_count: Counter[str] = Counter()
+    team_success_count: Counter[str] = Counter()
+    yes_fail_count: Counter[str] = Counter()
+    yes_success_count: Counter[str] = Counter()
+    contradiction_flips: Counter[str] = Counter()
+    accuse_count: Counter[str] = Counter()
+    defend_count: Counter[str] = Counter()
+    stance_last: Dict[Tuple[str, str], int] = {}
+
+    positive_cues = ("trust", "good", "innocent", "likely good", "clean")
+    negative_cues = ("sus", "suspicious", "evil", "liar", "lying", "bad")
+
+    for q in sorted(quests.keys()):
+        if int(q) >= int(target_quest):
+            continue
+        msgs = quests.get(int(q), [])
+        if not msgs:
+            continue
+
+        team, quest_failed = parse_party_and_outcome_from_msgs(msgs)
+        team_set = {str(p) for p in (team or [])}
+        if quest_failed is True:
+            for p in team_set:
+                team_fail_count[p] += 1
+        elif quest_failed is False:
+            for p in team_set:
+                team_success_count[p] += 1
+
+        for m in msgs:
+            speaker = str(m.get("player", ""))
+            text = str(m.get("msg", ""))
+            if speaker == "system":
+                if text.startswith("party vote outcome:"):
+                    vmap = _parse_vote_map(text)
+                    for name, vote in vmap.items():
+                        if vote == "yes":
+                            if quest_failed is True:
+                                yes_fail_count[str(name)] += 1
+                            elif quest_failed is False:
+                                yes_success_count[str(name)] += 1
+                continue
+
+            speaker_l = speaker.lower()
+            text_l = text.lower()
+            targets = [p for p in pset if str(p).lower() in text_l and str(p).lower() != speaker_l]
+            if not targets:
+                continue
+
+            polarity = 0
+            if any(tok in text_l for tok in negative_cues):
+                polarity = -1
+            elif any(tok in text_l for tok in positive_cues):
+                polarity = 1
+            if polarity == 0:
+                continue
+
+            for target in targets:
+                key = (speaker, target)
+                prev = stance_last.get(key)
+                if prev is not None and prev != polarity:
+                    contradiction_flips[speaker] += 1
+                stance_last[key] = polarity
+                if polarity < 0:
+                    accuse_count[speaker] += 1
+                else:
+                    defend_count[speaker] += 1
+
+    scored_players = sorted(pset, key=lambda p: (-(team_fail_count[p] + yes_fail_count[p]), p))
+    top_risk = scored_players[:3]
+    top_flip = [p for p, _ in sorted(contradiction_flips.items(), key=lambda x: (-x[1], x[0]))[:3]]
+
+    lines: List[str] = []
+    lines.append("SOCIAL DEDUCTION CUES (past quests only):")
+    lines.append(f"- Game: {game_id} | up to quest {int(target_quest)-1}")
+    lines.append("- Coalition risk (failed-team + yes-on-failed counts):")
+    for p in top_risk:
+        lines.append(
+            f"  - {p}: failed_team={team_fail_count[p]}, yes_on_failed={yes_fail_count[p]}, "
+            f"success_team={team_success_count[p]}, yes_on_success={yes_success_count[p]}"
+        )
+    if top_flip:
+        lines.append("- Stance contradictions (accuse/defend flips):")
+        for p in top_flip:
+            lines.append(
+                f"  - {p}: flips={contradiction_flips[p]}, accuse={accuse_count[p]}, defend={defend_count[p]}"
+            )
+    else:
+        lines.append("- Stance contradictions: none detected")
+
+    meta: Dict[str, Any] = {
+        "top_risk_players": top_risk,
+        "top_flip_players": top_flip,
+        "total_detected_flips": int(sum(contradiction_flips.values())),
+    }
+    return "\n".join(lines), meta
+
+
 @register_prompt("baseline_full_transcript")
 def prompt_baseline_full_transcript(
     target: MemoryEntry,
@@ -161,6 +288,7 @@ def prompt_belief_vector(
     players: List[str] = ctx["game_players"].get(game_id, [])
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
     valid_roles: List[str] = ctx["valid_roles"]
+    use_social_cues: bool = bool(ctx.get("use_social_cues", False))
 
     beliefs = ensure_belief_state_for_game(belief_state_by_game, game_id, players)
 
@@ -172,6 +300,10 @@ def prompt_belief_vector(
         past_state_lines.append(quest_state_line(game_id, int(q), quests[q]))
     current_msgs = quests.get(int(target.quest), [])
     current_transcript = quest_transcript_only(current_msgs)
+    social_block = ""
+    social_meta: Dict[str, Any] = {}
+    if use_social_cues:
+        social_block, social_meta = _social_deduction_memory(game_id, int(target.quest), quests, players)
 
     prompt = build_belief_vector_prompt(
         game_id=game_id,
@@ -181,8 +313,32 @@ def prompt_belief_vector(
         current_quest=int(target.quest),
         current_transcript=current_transcript,
         valid_roles=valid_roles,
+        social_cues=social_block,
     )
     meta: Dict[str, Any] = {"mode": "belief_vector"}
+    if use_social_cues:
+        meta["social_cues_enabled"] = True
+        meta["social_cues"] = social_meta
+    return prompt, meta
+
+
+@register_prompt("belief_vector+social")
+def prompt_belief_vector_social(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Belief-vector prompt with explicit social-deduction memory cues."""
+    local_ctx = dict(ctx)
+    local_ctx["use_social_cues"] = True
+    prompt, meta = prompt_belief_vector(target, retrieved, local_ctx)
+    prompt += (
+        "\n\nReasoning requirements before output:\n"
+        "- Use vote/outcome consistency and contradiction cues above.\n"
+        "- Prefer hypotheses that explain failed quests with minimal contradictions.\n"
+        "- Keep uncertainty as 'unknown' for weak evidence."
+    )
+    meta["mode"] = "belief_vector_social"
     return prompt, meta
 
 
@@ -264,6 +420,25 @@ def prompt_vector_memory(
     meta["mode"] = "vector_memory"
     meta["vector_memory_preview"] = state_preview_json(state, players)
     meta["vector_memory_summary"] = vec_summary
+    return prompt, meta
+
+
+@register_prompt("vector_memory+social")
+def prompt_vector_memory_social(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Vector-memory prompt augmented with social deduction cues."""
+    prompt, meta = prompt_vector_memory(target, retrieved, ctx)
+    game_id: str = target.game_id
+    quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
+    players: List[str] = ctx["game_players"].get(game_id, [])
+    social_block, social_meta = _social_deduction_memory(game_id, int(target.quest), quests, players)
+    prompt = prompt + "\n\n" + social_block + "\n"
+    meta["mode"] = "vector_memory_social"
+    meta["social_cues_enabled"] = True
+    meta["social_cues"] = social_meta
     return prompt, meta
 
 
@@ -604,6 +779,20 @@ def evaluate_config(
         I = I[mask]
         D = D[mask]
 
+        # Causal retrieval: within the same game, only allow memories from past quests.
+        causal_i: List[int] = []
+        causal_d: List[float] = []
+        dropped_future_same_game = 0
+        for j, s in zip(I, D):
+            candidate = all_entries[int(j)]
+            if candidate.game_id == target.game_id and int(candidate.quest) >= int(target.quest):
+                dropped_future_same_game += 1
+                continue
+            causal_i.append(int(j))
+            causal_d.append(float(s))
+        I = np.array(causal_i, dtype=np.int64)
+        D = np.array(causal_d, dtype=np.float32)
+
         # Use nearest-neighbor scores directly for memory augmentation
         I2, D2 = I, D
 
@@ -643,14 +832,19 @@ def evaluate_config(
             1 for e, _ in retrieved_pairs if isinstance(e.text, str) and "HEURISTIC SUMMARY:" in e.text
         )
         strategy_mode = str((prompt_meta or {}).get("mode", "")) if isinstance(prompt_meta, dict) else ""
+        social_cues_meta = (prompt_meta or {}).get("social_cues") if isinstance(prompt_meta, dict) else None
         heuristics_info: Dict[str, Any] = {
             "prompt_strategy": prompt_name,
             "strategy_mode": strategy_mode or prompt_name,
             "memory_format": memory_format,
             "template_summary_enabled": memory_format == "template+summary",
             "retrieved_count": len(retrieved_pairs),
+            "retrieval_pool_after_causal_filter": int(len(I2)),
+            "dropped_future_same_game": int(dropped_future_same_game),
             "retrieved_with_heuristic_summary_count": int(retrieved_with_summary_count),
-            "vector_memory_enabled": strategy_mode == "vector_memory",
+            "vector_memory_enabled": str(strategy_mode).startswith("vector_memory"),
+            "social_cues_enabled": bool((prompt_meta or {}).get("social_cues_enabled", False)) if isinstance(prompt_meta, dict) else False,
+            "social_total_detected_flips": int((social_cues_meta or {}).get("total_detected_flips", 0)) if isinstance(social_cues_meta, dict) else 0,
             "vector_memory_heuristics_explained_in_prompt": "Heuristics used to compute this memory:" in llm_prompt_text,
             "task_schema_enforced": True,
             "task_schema": '{"role": "<ROLE>"}',
@@ -920,7 +1114,8 @@ def evaluate_config(
         "prompt_strategy": prompt_name,
         "memory_format": memory_format,
         "template_summary_enabled": memory_format == "template+summary",
-        "vector_memory_enabled": prompt_name == "vector_memory",
+        "vector_memory_enabled": str(prompt_name).startswith("vector_memory"),
+        "social_cues_enabled": ("social" in str(prompt_name)),
         "avg_retrieved_with_heuristic_summary": (
             float(np.mean([r.get("heuristics", {}).get("retrieved_with_heuristic_summary_count", 0) for r in results]))
             if results
@@ -942,6 +1137,12 @@ def evaluate_config(
             )
             if results
             else 0.0
+        ),
+        "avg_dropped_future_same_game": (
+            float(np.mean([r.get("heuristics", {}).get("dropped_future_same_game", 0) for r in results])) if results else 0.0
+        ),
+        "avg_social_detected_flips": (
+            float(np.mean([r.get("heuristics", {}).get("social_total_detected_flips", 0) for r in results])) if results else 0.0
         ),
     }
 
