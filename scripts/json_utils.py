@@ -5,6 +5,24 @@ from typing import Any, Dict, List, Optional
 from scripts.llm_client import llm_role_predict
 
 
+def _find_string_field_recursive(obj: Any, key: str) -> Optional[str]:
+    """Find first string field by key recursively in nested dict/list structures."""
+    if isinstance(obj, dict):
+        value = obj.get(key)
+        if isinstance(value, str):
+            return value
+        for child in obj.values():
+            found = _find_string_field_recursive(child, key)
+            if isinstance(found, str):
+                return found
+    elif isinstance(obj, list):
+        for child in obj:
+            found = _find_string_field_recursive(child, key)
+            if isinstance(found, str):
+                return found
+    return None
+
+
 def parse_json_role(text: str | None) -> str | None:
     """Try to parse a JSON object like {"role": "..."} from text."""
     if not text:
@@ -12,8 +30,9 @@ def parse_json_role(text: str | None) -> str | None:
     s = text.strip()
     try:
         obj = json.loads(s)
-        if isinstance(obj, dict) and isinstance(obj.get("role"), str):
-            return obj.get("role")
+        role_val = _find_string_field_recursive(obj, "role")
+        if isinstance(role_val, str):
+            return role_val
     except Exception:
         pass
     try:
@@ -22,6 +41,20 @@ def parse_json_role(text: str | None) -> str | None:
             obj = json.loads(m.group(0))
             if isinstance(obj, dict) and isinstance(obj.get("role"), str):
                 return obj.get("role")
+    except Exception:
+        pass
+
+    # Scan all balanced JSON objects in the text and find the first with role.
+    try:
+        for i, ch in enumerate(s):
+            if ch != "{":
+                continue
+            obj = extract_object_from_brace(s, i)
+            if obj is None:
+                continue
+            role_val = _find_string_field_recursive(obj, "role")
+            if isinstance(role_val, str):
+                return role_val
     except Exception:
         pass
     return None
@@ -65,6 +98,11 @@ def extract_beliefs_object(text: str | None) -> Dict[str, Any] | None:
         obj = json.loads(s)
         if isinstance(obj, dict) and isinstance(obj.get("beliefs"), dict):
             return obj
+        # Also allow nested payloads where beliefs sits under another key.
+        if isinstance(obj, dict):
+            for v in obj.values():
+                if isinstance(v, dict) and isinstance(v.get("beliefs"), dict):
+                    return {"beliefs": v.get("beliefs")}
     except Exception:
         pass
     try:
@@ -83,6 +121,10 @@ def extract_beliefs_object(text: str | None) -> Dict[str, Any] | None:
             obj = extract_object_from_brace(s, idx)
             if isinstance(obj, dict) and isinstance(obj.get("beliefs"), dict):
                 return obj
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    if isinstance(v, dict) and isinstance(v.get("beliefs"), dict):
+                        return {"beliefs": v.get("beliefs")}
     except Exception:
         return None
     return None
@@ -140,22 +182,38 @@ def extract_role_label(text: str | None, valid_roles: List[str]) -> str | None:
     """
     role = parse_json_role(text)
     if role and valid_roles:
+        role_key = role.strip().lower()
         for vr in valid_roles:
-            if role.strip().lower() == vr.lower():
+            if role_key == vr.lower():
                 return vr
+
     if not text:
         return None
+
     t = text.strip()
     tl = t.lower()
-    hits = [r for r in valid_roles if r.lower() in tl]
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        return sorted(hits, key=len, reverse=True)[0]
-    for r in valid_roles:
+
+    # 1) Exact match against a canonical role label.
+    for vr in valid_roles:
+        if tl == vr.lower():
+            return vr
+
+    # 2) Whole-token/word-boundary matches.
+    boundary_hits: List[str] = []
+    for vr in valid_roles:
         try:
-            if re.search(rf"\b{re.escape(r)}\b", t, flags=re.IGNORECASE):
-                return r
+            if re.search(rf"\b{re.escape(vr)}\b", t, flags=re.IGNORECASE):
+                boundary_hits.append(vr)
         except re.error:
             continue
+    if len(boundary_hits) == 1:
+        return boundary_hits[0]
+    if len(boundary_hits) > 1:
+        # Ambiguous mentions (e.g., "servant-1 or servant-2"): do not guess.
+        return None
+
+    # 3) Conservative substring fallback only when unique.
+    contains_hits = [r for r in valid_roles if r.lower() in tl]
+    if len(contains_hits) == 1:
+        return contains_hits[0]
     return None

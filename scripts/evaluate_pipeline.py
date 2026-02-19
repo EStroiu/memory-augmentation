@@ -46,6 +46,7 @@ from scripts.prompting import (
 )
 from scripts.belief_vector import (
     ensure_belief_state_for_game,
+    ensure_belief_confidence_for_game,
     build_belief_vector_prompt,
     apply_belief_updates,
 )
@@ -356,6 +357,7 @@ def llm_post_typechat_beliefs(
     llm_trace: Optional[List[Dict[str, Any]]] = ctx.get("llm_trace")
     target: MemoryEntry = ctx["target"]
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
+    belief_confidence_by_game: Dict[str, Dict[str, float]] = ctx.get("belief_confidence_by_game", {})
     game_players: Dict[str, List[str]] = ctx.get("game_players", {})
 
     beliefs_obj: Dict[str, Any] | None = None
@@ -364,11 +366,16 @@ def llm_post_typechat_beliefs(
     repaired_preview: Optional[str] = None
     beliefs_preview: Optional[str] = None
     proposer_from_beliefs: Optional[str] = None
+    proposer_override_applied: bool = False
+    fallback_reason: Optional[str] = None
+    decision_path: List[str] = []
 
     text = raw_pred or ""
     beliefs_container = extract_beliefs_object(text)
     if isinstance(beliefs_container, dict):
         beliefs_obj = beliefs_container.get("beliefs") if isinstance(beliefs_container.get("beliefs"), dict) else None
+        if isinstance(beliefs_obj, dict):
+            decision_path.append("beliefs:raw")
     if beliefs_obj is None and text:
         # Build a concrete schema using the actual player names for this game.
         players = game_players.get(target.game_id, [])
@@ -396,24 +403,56 @@ def llm_post_typechat_beliefs(
         if isinstance(repaired_container, dict):
             beliefs_obj = repaired_container.get("beliefs") if isinstance(repaired_container.get("beliefs"), dict) else None
             used_repair = beliefs_obj is not None
+            if beliefs_obj is not None:
+                decision_path.append("beliefs:repair")
 
     pred_role = extract_role_label(raw_pred, valid_roles)
+    if pred_role is not None:
+        decision_path.append("role:raw")
     if isinstance(beliefs_obj, dict):
         players = game_players.get(target.game_id, [])
         beliefs = ensure_belief_state_for_game(belief_state_by_game, target.game_id, players)
-        apply_belief_updates(beliefs, beliefs_obj, valid_roles)
+        belief_conf = ensure_belief_confidence_for_game(belief_confidence_by_game, target.game_id, players)
+        apply_belief_updates(beliefs, beliefs_obj, valid_roles, belief_confidence=belief_conf)
         try:
             # Preview normalized beliefs (what we actually store/use)
             beliefs_preview = json.dumps({"beliefs": {str(p): beliefs.get(str(p), "unknown") for p in beliefs_obj.keys()}}, ensure_ascii=False)[:160]
         except Exception:
             beliefs_preview = None
         if isinstance(target.proposer, str):
-            pr = beliefs.get(target.proposer)
+            proposer_key = str(target.proposer)
+            pr = beliefs.get(proposer_key)
             if isinstance(pr, str):
                 mapped_pr = extract_role_label(pr, valid_roles)
                 if mapped_pr is not None:
-                    pred_role = mapped_pr
                     proposer_from_beliefs = mapped_pr
+                    proposer_conf = float(belief_conf.get(proposer_key, 0.0))
+                    # Conservative policy: use proposer-derived role only if
+                    # this proposer was updated in the current beliefs payload,
+                    # and only to fill missing predictions (or confirm a match).
+                    proposer_updated_now = proposer_key in {str(k) for k in beliefs_obj.keys()}
+                    if proposer_updated_now:
+                        if pred_role is None and proposer_conf >= 0.35:
+                            pred_role = mapped_pr
+                            proposer_override_applied = True
+                            decision_path.append("role:proposer_updated")
+                        elif pred_role == mapped_pr:
+                            proposer_override_applied = True
+                            decision_path.append("role:proposer_confirmed")
+
+    # If still missing, use existing proposer belief state as a fallback.
+    if pred_role is None and isinstance(target.proposer, str):
+        players = game_players.get(target.game_id, [])
+        beliefs = ensure_belief_state_for_game(belief_state_by_game, target.game_id, players)
+        belief_conf = ensure_belief_confidence_for_game(belief_confidence_by_game, target.game_id, players)
+        proposer_key = str(target.proposer)
+        pr_state = beliefs.get(proposer_key)
+        mapped_state = extract_role_label(pr_state, valid_roles) if isinstance(pr_state, str) else None
+        proposer_conf = float(belief_conf.get(proposer_key, 0.0))
+        if mapped_state is not None and proposer_conf >= 0.55:
+            pred_role = mapped_state
+            proposer_from_beliefs = proposer_from_beliefs or mapped_state
+            decision_path.append("role:proposer_state_fallback")
 
     # If still no pred_role, fallback to role repair
     if pred_role is None and text:
@@ -426,10 +465,25 @@ def llm_post_typechat_beliefs(
             True,
             trace=llm_trace,
         )
+        repair_attempted = True
+        if isinstance(repaired_role, str) and repaired_preview is None:
+            try:
+                repaired_preview = repaired_role.replace("\n", " ")[:160]
+            except Exception:
+                repaired_preview = None
         pr2 = extract_role_label(repaired_role, valid_roles) if repaired_role else None
         if pr2 is not None and pred_role is None:
             used_repair = True
+            decision_path.append("role:repair")
         pred_role = pred_role or pr2
+
+    if pred_role is None:
+        if not text.strip():
+            fallback_reason = "empty_raw_prediction"
+        elif not isinstance(beliefs_obj, dict):
+            fallback_reason = "beliefs_unparsed"
+        else:
+            fallback_reason = "no_valid_role_after_fallbacks"
 
     return {
         "pred_role": pred_role,
@@ -438,7 +492,10 @@ def llm_post_typechat_beliefs(
         "repair_attempted": repair_attempted,
         "repaired_preview": repaired_preview,
         "proposer_from_beliefs": proposer_from_beliefs,
+        "proposer_override_applied": proposer_override_applied,
         "beliefs_preview": beliefs_preview,
+        "fallback_reason": fallback_reason,
+        "decision_path": decision_path,
     }
 
 
@@ -515,6 +572,7 @@ def evaluate_config(
 
     # For belief baseline and LLM post-processing: per-game belief vectors as dict[player] -> role
     belief_state_by_game: Dict[str, Dict[str, str]] = defaultdict(dict)
+    belief_confidence_by_game: Dict[str, Dict[str, float]] = defaultdict(dict)
 
     # For vector_memory prompt: per-game vector states
     vector_state_by_game: Dict[str, Any] = {}
@@ -522,6 +580,8 @@ def evaluate_config(
     # LLM fixer statistics
     fixer_total_calls: int = 0
     fixer_used_repair: int = 0
+    fixer_null_pred: int = 0
+    fixer_fallback_reasons: Dict[str, int] = defaultdict(int)
 
     def _maybe_truncate(text: Optional[str]) -> Optional[str]:
         if text is None:
@@ -567,6 +627,7 @@ def evaluate_config(
             "game_quests": game_quests,
             "game_players": game_players,
             "belief_state_by_game": belief_state_by_game,
+            "belief_confidence_by_game": belief_confidence_by_game,
             "valid_roles": valid_roles,
             "vector_state_by_game": vector_state_by_game,
         }
@@ -674,6 +735,7 @@ def evaluate_config(
                     "openai_api_key": openai_api_key,
                     "target": target,
                     "belief_state_by_game": belief_state_by_game,
+                    "belief_confidence_by_game": belief_confidence_by_game,
                     "game_players": game_players,
                     "llm_trace": llm_trace,
                 },
@@ -682,6 +744,10 @@ def evaluate_config(
             processed_used_repair = bool(post_out.get("used_repair"))
             if processed_used_repair:
                 fixer_used_repair += 1
+            if pred_role is None:
+                fixer_null_pred += 1
+                null_reason = str(post_out.get("fallback_reason") or "unknown")
+                fixer_fallback_reasons[null_reason] += 1
             processed_beliefs_preview = post_out.get("beliefs_preview")
             proposer_from_beliefs = post_out.get("proposer_from_beliefs")
         else:
@@ -815,6 +881,9 @@ def evaluate_config(
                     {
                         "beliefs_preview": processed_beliefs_preview,
                         "proposer_from_beliefs": proposer_from_beliefs,
+                        "proposer_override_applied": bool(post_out.get("proposer_override_applied")),
+                        "fallback_reason": post_out.get("fallback_reason"),
+                        "decision_path": post_out.get("decision_path"),
                     }
                     if llm_fixer == "typechat_beliefs"
                     else {}
@@ -919,6 +988,9 @@ def evaluate_config(
             "total_calls": fixer_total_calls,
             "used_repair": fixer_used_repair,
             "repair_rate": (fixer_used_repair / fixer_total_calls) if fixer_total_calls > 0 else 0.0,
+            "null_predictions": fixer_null_pred,
+            "null_prediction_rate": (fixer_null_pred / fixer_total_calls) if fixer_total_calls > 0 else 0.0,
+            "fallback_reasons": dict(fixer_fallback_reasons),
         },
     }
     return agg, results
