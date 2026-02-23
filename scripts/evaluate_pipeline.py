@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -173,10 +174,27 @@ def _social_deduction_memory(
     contradiction_flips: Counter[str] = Counter()
     accuse_count: Counter[str] = Counter()
     defend_count: Counter[str] = Counter()
+    speaker_turns: Counter[str] = Counter()
     stance_last: Dict[Tuple[str, str], int] = {}
 
-    positive_cues = ("trust", "good", "innocent", "likely good", "clean")
-    negative_cues = ("sus", "suspicious", "evil", "liar", "lying", "bad")
+    def _explicit_stance_for_target(text_l: str, target: str) -> int:
+        """Return -1/0/+1 only for explicit target-linked stance statements."""
+        target_l = target.lower()
+        neg_patterns = [
+            rf"\b{re.escape(target_l)}\b\s+(is|seems|looks)\s+(evil|sus|suspicious|bad)",
+            rf"\b{re.escape(target_l)}\b\s+(is\s+)?(lying|a\s+liar)",
+            rf"\b(don't\s+trust|dont\s+trust|sus|suspicious\s+of)\s+\b{re.escape(target_l)}\b",
+        ]
+        pos_patterns = [
+            rf"\b{re.escape(target_l)}\b\s+(is|seems|looks)\s+(good|clean|innocent)",
+            rf"\b(i\s+)?(trust|believe)\s+\b{re.escape(target_l)}\b",
+            rf"\b{re.escape(target_l)}\b\s+(is\s+)?(trustworthy|probably\s+good|likely\s+good)",
+        ]
+        if any(re.search(p, text_l) for p in neg_patterns):
+            return -1
+        if any(re.search(p, text_l) for p in pos_patterns):
+            return 1
+        return 0
 
     for q in sorted(quests.keys()):
         if int(q) >= int(target_quest):
@@ -210,19 +228,15 @@ def _social_deduction_memory(
 
             speaker_l = speaker.lower()
             text_l = text.lower()
+            speaker_turns[speaker] += 1
             targets = [p for p in pset if str(p).lower() in text_l and str(p).lower() != speaker_l]
             if not targets:
                 continue
 
-            polarity = 0
-            if any(tok in text_l for tok in negative_cues):
-                polarity = -1
-            elif any(tok in text_l for tok in positive_cues):
-                polarity = 1
-            if polarity == 0:
-                continue
-
             for target in targets:
+                polarity = _explicit_stance_for_target(text_l, str(target))
+                if polarity == 0:
+                    continue
                 key = (speaker, target)
                 prev = stance_last.get(key)
                 if prev is not None and prev != polarity:
@@ -235,7 +249,17 @@ def _social_deduction_memory(
 
     scored_players = sorted(pset, key=lambda p: (-(team_fail_count[p] + yes_fail_count[p]), p))
     top_risk = scored_players[:3]
-    top_flip = [p for p, _ in sorted(contradiction_flips.items(), key=lambda x: (-x[1], x[0]))[:3]]
+    contradiction_rate: Dict[str, float] = {
+        p: float(contradiction_flips[p]) / float(max(1, speaker_turns[p])) for p in pset
+    }
+    top_flip = [
+        p
+        for p, _ in sorted(
+            contradiction_rate.items(),
+            key=lambda x: (-x[1], -contradiction_flips[x[0]], x[0]),
+        )[:3]
+        if contradiction_flips.get(p, 0) > 0
+    ]
 
     lines: List[str] = []
     lines.append("SOCIAL DEDUCTION CUES (past quests only):")
@@ -247,10 +271,11 @@ def _social_deduction_memory(
             f"success_team={team_success_count[p]}, yes_on_success={yes_success_count[p]}"
         )
     if top_flip:
-        lines.append("- Stance contradictions (accuse/defend flips):")
+        lines.append("- Stance contradictions (explicit target-linked accuse/defend flips):")
         for p in top_flip:
             lines.append(
-                f"  - {p}: flips={contradiction_flips[p]}, accuse={accuse_count[p]}, defend={defend_count[p]}"
+                f"  - {p}: flips={contradiction_flips[p]}, flip_rate={contradiction_rate.get(p, 0.0):.2f}, "
+                f"accuse={accuse_count[p]}, defend={defend_count[p]}"
             )
     else:
         lines.append("- Stance contradictions: none detected")
@@ -259,6 +284,7 @@ def _social_deduction_memory(
         "top_risk_players": top_risk,
         "top_flip_players": top_flip,
         "total_detected_flips": int(sum(contradiction_flips.values())),
+        "contradiction_rate_by_player": {p: round(float(contradiction_rate.get(p, 0.0)), 4) for p in pset},
     }
     return "\n".join(lines), meta
 
@@ -332,13 +358,32 @@ def prompt_belief_vector_social(
     local_ctx = dict(ctx)
     local_ctx["use_social_cues"] = True
     prompt, meta = prompt_belief_vector(target, retrieved, local_ctx)
-    prompt += (
-        "\n\nReasoning requirements before output:\n"
-        "- Use vote/outcome consistency and contradiction cues above.\n"
-        "- Prefer hypotheses that explain failed quests with minimal contradictions.\n"
-        "- Keep uncertainty as 'unknown' for weak evidence."
+    game_id: str = target.game_id
+    quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
+    players: List[str] = ctx["game_players"].get(game_id, [])
+    beliefs = ensure_belief_state_for_game(ctx["belief_state_by_game"], game_id, players)
+    past_state_lines: List[str] = []
+    for q in sorted(quests.keys()):
+        if int(q) >= int(target.quest):
+            continue
+        past_state_lines.append(quest_state_line(game_id, int(q), quests[q]))
+    current_msgs = quests.get(int(target.quest), [])
+    current_transcript = quest_transcript_only(current_msgs)
+    social_block, social_meta = _social_deduction_memory(game_id, int(target.quest), quests, players)
+    prompt = build_belief_vector_prompt(
+        game_id=game_id,
+        players=players,
+        belief_vector=beliefs,
+        past_state_lines=past_state_lines,
+        current_quest=int(target.quest),
+        current_transcript=current_transcript,
+        valid_roles=ctx["valid_roles"],
+        social_cues=social_block,
+        reasoning_mode="hypothesis",
     )
     meta["mode"] = "belief_vector_social"
+    meta["social_cues_enabled"] = True
+    meta["social_cues"] = social_meta
     return prompt, meta
 
 
@@ -534,6 +579,7 @@ def llm_post_typechat_beliefs(
     belief_state_by_game: Dict[str, Dict[str, str]] = ctx["belief_state_by_game"]
     belief_confidence_by_game: Dict[str, Dict[str, float]] = ctx.get("belief_confidence_by_game", {})
     game_players: Dict[str, List[str]] = ctx.get("game_players", {})
+    social_cues_meta: Dict[str, Any] = ctx.get("social_cues_meta", {}) or {}
 
     beliefs_obj: Dict[str, Any] | None = None
     used_repair = False
@@ -544,6 +590,16 @@ def llm_post_typechat_beliefs(
     proposer_override_applied: bool = False
     fallback_reason: Optional[str] = None
     decision_path: List[str] = []
+
+    risky_players = {str(p) for p in (social_cues_meta.get("top_risk_players") or [])}
+    flip_players = {str(p) for p in (social_cues_meta.get("top_flip_players") or [])}
+
+    def _allow_proposer_override(proposer_key: str, proposer_conf: float) -> bool:
+        if proposer_key in flip_players and proposer_conf < 0.80:
+            return False
+        if proposer_key in risky_players and proposer_conf < 0.65:
+            return False
+        return True
 
     text = raw_pred or ""
     beliefs_container = extract_beliefs_object(text)
@@ -607,13 +663,15 @@ def llm_post_typechat_beliefs(
                     # and only to fill missing predictions (or confirm a match).
                     proposer_updated_now = proposer_key in {str(k) for k in beliefs_obj.keys()}
                     if proposer_updated_now:
-                        if pred_role is None and proposer_conf >= 0.35:
+                        if pred_role is None and proposer_conf >= 0.35 and _allow_proposer_override(proposer_key, proposer_conf):
                             pred_role = mapped_pr
                             proposer_override_applied = True
                             decision_path.append("role:proposer_updated")
                         elif pred_role == mapped_pr:
                             proposer_override_applied = True
                             decision_path.append("role:proposer_confirmed")
+                        elif pred_role is None:
+                            decision_path.append("role:proposer_blocked_social")
 
     # If still missing, use existing proposer belief state as a fallback.
     if pred_role is None and isinstance(target.proposer, str):
@@ -624,10 +682,12 @@ def llm_post_typechat_beliefs(
         pr_state = beliefs.get(proposer_key)
         mapped_state = extract_role_label(pr_state, valid_roles) if isinstance(pr_state, str) else None
         proposer_conf = float(belief_conf.get(proposer_key, 0.0))
-        if mapped_state is not None and proposer_conf >= 0.55:
+        if mapped_state is not None and proposer_conf >= 0.55 and _allow_proposer_override(proposer_key, proposer_conf):
             pred_role = mapped_state
             proposer_from_beliefs = proposer_from_beliefs or mapped_state
             decision_path.append("role:proposer_state_fallback")
+        elif mapped_state is not None and proposer_conf >= 0.55:
+            decision_path.append("role:proposer_state_blocked_social")
 
     # If still no pred_role, fallback to role repair
     if pred_role is None and text:
@@ -931,6 +991,7 @@ def evaluate_config(
                     "belief_state_by_game": belief_state_by_game,
                     "belief_confidence_by_game": belief_confidence_by_game,
                     "game_players": game_players,
+                    "social_cues_meta": social_cues_meta if isinstance(social_cues_meta, dict) else {},
                     "llm_trace": llm_trace,
                 },
             )

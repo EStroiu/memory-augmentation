@@ -102,6 +102,7 @@ def build_belief_vector_prompt(
     current_transcript: str,
     valid_roles: List[str],
     social_cues: str = "",
+    reasoning_mode: str = "standard",
 ) -> str:
     """Build a closed-set belief-update prompt for the current quest."""
     allowed_roles: List[str] = []
@@ -164,10 +165,22 @@ def build_belief_vector_prompt(
     else:
         example_pairs = ['"player-1": "unknown"', '"player-2": "unknown"']
 
-    lines.append(
-        "Respond ONLY with a single JSON object of the form: "
-        "{\"beliefs\": {" + ", ".join(example_pairs) + ", ...}}."
-    )
+    if reasoning_mode == "hypothesis":
+        lines.append(
+            "First reason with two competing hypotheses, then commit to one final belief map. "
+            "Respond ONLY as a single JSON object with this shape: "
+            "{\"hypotheses\": ["
+            "{\"name\": \"H1\", \"summary\": \"...\", \"disconfirming_evidence\": \"...\"},"
+            "{\"name\": \"H2\", \"summary\": \"...\", \"disconfirming_evidence\": \"...\"}"
+            "], \"beliefs\": {"
+            + ", ".join(example_pairs)
+            + ", ...}}."
+        )
+    else:
+        lines.append(
+            "Respond ONLY with a single JSON object of the form: "
+            "{\"beliefs\": {" + ", ".join(example_pairs) + ", ...}}."
+        )
     lines.append("Output must be exactly one line of valid JSON.")
     lines.append("Do not include explanations, prefixes, markdown/code fences, trailing commas, or extra keys.")
     lines.append("If unsure about a player, set that player value to 'unknown' (still include every player).")
