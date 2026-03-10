@@ -18,8 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
-import faiss
 import plotly.graph_objects as go
 from plotly.offline import plot as plotly_offline_plot
 from scripts.metrics_utils import average_aggregates, viz_prompt_lengths, viz_confusion_matrix
@@ -27,9 +25,6 @@ from scripts.template_summary import (
     MemoryEntry,
     load_game_json,
     build_memory_entries,
-    build_embeddings,
-    build_faiss_ip_index,
-    retrieve_top,
     messages_by_quest,
     quest_state_line,
     quest_transcript_only,
@@ -73,8 +68,6 @@ class ExperimentConfig:
 
     data_dir: Path
     outdir: Path = Path("outputs/eval")
-    k: int = 3
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     use_llm: bool = False
     llm_model: str = "ollama:llama2:13b"
     openai_api_key: Optional[str] = None
@@ -740,9 +733,7 @@ def ensure_dir(path: Path) -> None:
 
 def evaluate_config(
     files: List[Path],
-    k: int,
     memory_format: str,
-    model_name: str,
     use_llm: bool,
     openai_model: str,
     openai_api_key: str | None,
@@ -753,9 +744,6 @@ def evaluate_config(
     llm_io_max_chars: int = 0,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
-
-    Retrieval metrics exclude the query (self) from candidate results to avoid trivial rank=1.
-    Positives are defined as entries from the same game as the query (excluding self).
     """
     t0 = time.time()
     # Build entries across all games
@@ -782,18 +770,11 @@ def evaluate_config(
     build_elapsed = time.time() - t0
     print(f"    [progress] Built {len(all_entries)} entries (memory_format='{memory_format}') in {build_elapsed:.2f}s")
 
-    # Embeddings and index
-    t1 = time.time()
-    emb, model = build_embeddings(all_entries, model_name)
-    index = build_faiss_ip_index(emb)
-    embed_elapsed = time.time() - t1
-    print(f"    [progress] Embeddings + index ready in {embed_elapsed:.2f}s (model='{model_name}')")
-
     # Enumerate valid roles from dataset once (for parsing LLM output consistently)
     valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
 
     results: List[Dict[str, Any]] = []
-    # Classification counters for proposer-role prediction via retrieval (top-1 label transfer)
+    # Classification counters for proposer-role prediction
     roles_seen: set[str] = set()
     tp: Dict[str, int] = defaultdict(int)
     fp: Dict[str, int] = defaultdict(int)
@@ -830,38 +811,18 @@ def evaluate_config(
         return text
 
     for qi, target in enumerate(all_entries):
-        q_vec = model.encode([target.text], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
-        # Retrieve more than k for stability
-        D, I = retrieve_top(index, q_vec, topn=min(max(50, k * 5), len(all_entries)))
-
-        # Exclude self from candidate pool
-        mask = I != qi
-        I = I[mask]
-        D = D[mask]
-
-        # Causal retrieval: within the same game, only allow memories from past quests.
-        causal_i: List[int] = []
-        causal_d: List[float] = []
-        dropped_future_same_game = 0
-        for j, s in zip(I, D):
+        # Sequential memory: include only past quests from the same game.
+        sequential_memory_idx: List[int] = []
+        for j in per_game_indices.get(target.game_id, []):
             candidate = all_entries[int(j)]
-            if candidate.game_id == target.game_id and int(candidate.quest) >= int(target.quest):
-                dropped_future_same_game += 1
-                continue
-            causal_i.append(int(j))
-            causal_d.append(float(s))
-        I = np.array(causal_i, dtype=np.int64)
-        D = np.array(causal_d, dtype=np.float32)
+            if int(candidate.quest) < int(target.quest):
+                sequential_memory_idx.append(int(j))
 
-        # Use nearest-neighbor scores directly for memory augmentation
-        I2, D2 = I, D
-
-        # Top-k selection
-        topk_idx = list(I2[: k])
-        topk_scores = list(D2[: k])
+        # Keep chronological order so memory grows naturally round by round.
+        sequential_memory_idx.sort(key=lambda idx: int(all_entries[idx].quest))
 
         # Prompts and stats (strategy-based)
-        retrieved_pairs = [(all_entries[j], float(s)) for j, s in zip(topk_idx, topk_scores)]
+        retrieved_pairs = [(all_entries[j], 1.0) for j in sequential_memory_idx]
         roles_list = ", ".join(valid_roles) if valid_roles else ""
         task_suffix = "\n\nTask: Predict the role of the player who proposed the party."
         if roles_list:
@@ -898,9 +859,7 @@ def evaluate_config(
             "strategy_mode": strategy_mode or prompt_name,
             "memory_format": memory_format,
             "template_summary_enabled": memory_format == "template+summary",
-            "retrieved_count": len(retrieved_pairs),
-            "retrieval_pool_after_causal_filter": int(len(I2)),
-            "dropped_future_same_game": int(dropped_future_same_game),
+            "sequential_memory_count": len(retrieved_pairs),
             "retrieved_with_heuristic_summary_count": int(retrieved_with_summary_count),
             "vector_memory_enabled": str(strategy_mode).startswith("vector_memory"),
             "social_cues_enabled": bool((prompt_meta or {}).get("social_cues_enabled", False)) if isinstance(prompt_meta, dict) else False,
@@ -955,7 +914,7 @@ def evaluate_config(
                     memory_format=memory_format,
                     pchars=len(llm_prompt_to_use),
                     heur_count=heuristics_info.get("retrieved_with_heuristic_summary_count", 0),
-                    retrieved=heuristics_info.get("retrieved_count", 0),
+                    retrieved=heuristics_info.get("sequential_memory_count", 0),
                     vec_heur=heuristics_info.get("vector_memory_heuristics_explained_in_prompt", False),
                 )
             )
@@ -1006,9 +965,9 @@ def evaluate_config(
             processed_beliefs_preview = post_out.get("beliefs_preview")
             proposer_from_beliefs = post_out.get("proposer_from_beliefs")
         else:
-            # Fallback heuristic: transfer top-1 retrieved proposer_role
-            if len(I2) > 0:
-                cand_role = all_entries[int(I2[0])].proposer_role
+            # Fallback heuristic: transfer proposer role from most recent prior round in same game
+            if len(sequential_memory_idx) > 0:
+                cand_role = all_entries[int(sequential_memory_idx[-1])].proposer_role
                 if cand_role is not None:
                     pred_role = cand_role
         if true_role is not None:
@@ -1072,9 +1031,13 @@ def evaluate_config(
 
         res = {
             "target": asdict(target),
-            "topk": [
-                {"entry_id": all_entries[j].entry_id, "game_id": all_entries[j].game_id, "quest": int(all_entries[j].quest), "score": float(s)}
-                for j, s in zip(topk_idx, topk_scores)
+            "memory_history": [
+                {
+                    "entry_id": all_entries[j].entry_id,
+                    "game_id": all_entries[j].game_id,
+                    "quest": int(all_entries[j].quest),
+                }
+                for j in sequential_memory_idx
             ],
             "memory_format": memory_format,
             "prompt_stats": pstats,
@@ -1104,7 +1067,7 @@ def evaluate_config(
                 "prompt_strategy": prompt_name,
                 "strategy_mode": heuristics_info.get("strategy_mode"),
                 "memory_format": memory_format,
-                "retrieved_count": heuristics_info.get("retrieved_count"),
+                "sequential_memory_count": heuristics_info.get("sequential_memory_count"),
                 "retrieved_with_heuristic_summary_count": heuristics_info.get("retrieved_with_heuristic_summary_count"),
                 "vector_memory_enabled": heuristics_info.get("vector_memory_enabled"),
                 "vector_memory_heuristics_explained_in_prompt": heuristics_info.get("vector_memory_heuristics_explained_in_prompt"),
@@ -1182,8 +1145,8 @@ def evaluate_config(
             if results
             else 0.0
         ),
-        "avg_retrieved_count": (
-            float(np.mean([r.get("heuristics", {}).get("retrieved_count", 0) for r in results]))
+        "avg_sequential_memory_count": (
+            float(np.mean([r.get("heuristics", {}).get("sequential_memory_count", 0) for r in results]))
             if results
             else 0.0
         ),
@@ -1198,9 +1161,6 @@ def evaluate_config(
             )
             if results
             else 0.0
-        ),
-        "avg_dropped_future_same_game": (
-            float(np.mean([r.get("heuristics", {}).get("dropped_future_same_game", 0) for r in results])) if results else 0.0
         ),
         "avg_social_detected_flips": (
             float(np.mean([r.get("heuristics", {}).get("social_total_detected_flips", 0) for r in results])) if results else 0.0
@@ -1237,9 +1197,7 @@ def evaluate_config(
             f"repairs={fixer_used_repair} repair_rate={repair_rate:.3f}"
         )
     agg = {
-        "k": int(k),
         "memory_format": memory_format,
-        "model": model_name,
         "avg_prompt_sizes": avg_prompt_sizes,
         "heuristic_usage": heuristic_usage,
         "clf_by_role": clf_by_role,
@@ -1261,11 +1219,9 @@ def evaluate_config(
 # ---------- Combined evaluation (baseline vs current) ----------
 
 def main(argv: List[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Evaluate retrieval and prompting pipeline over an Avalon dataset.")
+    ap = argparse.ArgumentParser(description="Evaluate sequential memory prompting pipeline over an Avalon dataset.")
     ap.add_argument("--data_dir", type=str, default="dataset", help="Directory containing *.json games")
-    ap.add_argument("--k", type=int, default=3, help="Top-k for retrieval")
     ap.add_argument("--memory_format", type=str, default="template", choices=["template", "template+summary"], help="Memory format for entries")
-    ap.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer embedding model name")
     ap.add_argument("--outdir", type=str, default="outputs/eval", help="Base output directory for saving results and visuals")
     ap.add_argument("--llm", action="store_true", help="Call an LLM for downstream role prediction (TypeChat-like JSON output enforced)")
     ap.add_argument("--llm_model", type=str, default="ollama:llama2:13b", help="LLM identifier. Use 'ollama:<model>' (e.g., 'ollama:llama3:8b-instruct') or 'openai:<model>' for OpenAI.")
@@ -1273,13 +1229,6 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--max_games", type=int, default=None, help="Limit number of games for quick tests")
     ap.add_argument("--num_runs", type=int, default=1, help="Repeat the experiment N times and average results")
     ap.add_argument("--seed", type=int, default=42, help="Base random seed (incremented per run)")
-
-    # Performance knobs (propagated via env vars for SentenceTransformer)
-    ap.add_argument("--embed_batch_size", type=int, default=int(os.getenv("EMBED_BATCH_SIZE", "64")), help="Embedding batch size (higher -> faster on GPU, may use more VRAM)")
-    ap.add_argument("--embed_cache", action="store_true", default=os.getenv("EMBED_CACHE", "1").strip().lower() not in ("0", "false", "no"), help="Cache embeddings to disk for faster reruns")
-    ap.add_argument("--no_embed_cache", action="store_true", help="Disable embedding cache")
-    ap.add_argument("--embed_use_gpu", action="store_true", default=os.getenv("EMBED_USE_GPU", "1").strip().lower() not in ("0", "false", "no"), help="Prefer GPU for embeddings when available")
-    ap.add_argument("--no_embed_use_gpu", action="store_true", help="Disable GPU usage for embeddings")
 
     # New high-level experiment knobs
     ap.add_argument("--baseline_prompt", type=str, default="baseline_full_transcript", help="Prompt strategy name for baseline (see README for options). Use 'none' to skip.")
@@ -1294,38 +1243,6 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--no_save_llm_io", action="store_true", help="Do not save LLM prompts/responses into results JSON")
     ap.add_argument("--llm_io_max_chars", type=int, default=0, help="Optional truncation limit for saved prompts/responses (0 = no truncation)")
     args = ap.parse_args(argv)
-
-    # Apply performance flags to environment for downstream modules
-    try:
-        os.environ["EMBED_BATCH_SIZE"] = str(int(args.embed_batch_size))
-        if bool(args.no_embed_cache):
-            os.environ["EMBED_CACHE"] = "0"
-        else:
-            os.environ["EMBED_CACHE"] = "1" if bool(args.embed_cache) else "0"
-        if bool(args.no_embed_use_gpu):
-            os.environ["EMBED_USE_GPU"] = "0"
-        else:
-            os.environ["EMBED_USE_GPU"] = "1" if bool(args.embed_use_gpu) else "0"
-    except Exception:
-        pass
-
-    # Heuristic auto-correction: users sometimes pass the LLM model to --model.
-    # If --model looks like an LLM identifier and --llm_model is still default, swap them.
-    try:
-        default_llm_model = ap.get_default("llm_model")
-        default_embed_model = ap.get_default("model")
-        if args.llm and isinstance(args.model, str) and args.model.lower().startswith(("ollama:", "openai:")):
-            # Only swap if user did not explicitly set --llm_model different from default.
-            if args.llm_model == default_llm_model:
-                print(
-                    f"[warn] Detected LLM id '{args.model}' passed to --model. "
-                    f"Treating it as --llm_model and restoring embedding model to '{default_embed_model}'.",
-                    file=sys.stderr,
-                )
-                args.llm_model = args.model
-                args.model = default_embed_model
-    except Exception:
-        pass
 
     # Apply experiment presets on top of parsed args
     if args.exp == "baseline_full":
@@ -1372,12 +1289,12 @@ def main(argv: List[str] | None = None) -> int:
             print(f"[info] Planned runs: {args.num_runs}; LLM calls/run: {total_llm_calls_per_run}; total: {total_llm_calls_all}")
             print(f"[estimate] Avg latency ~{avg_latency:.1f}s -> est prompting time ~{est_minutes:.1f} min (override with LLM_AVG_LATENCY_SEC)")
         else:
-            print("[info] LLM disabled; using retrieval heuristic for role prediction.")
+            print("[info] LLM disabled; using most recent in-game memory heuristic for role prediction.")
     except Exception as e:
         print(f"[warn] Pre-run estimation unavailable: {e}")
 
     ts = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
-    run_dir = Path(args.outdir) / f"{ts}_k-{args.k}_mem-{args.memory_format}_exp-{args.exp}"
+    run_dir = Path(args.outdir) / f"{ts}_mem-{args.memory_format}_exp-{args.exp}"
     ensure_dir(run_dir)
 
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
@@ -1401,9 +1318,7 @@ def main(argv: List[str] | None = None) -> int:
             print(f"  Evaluating baseline strategy='{args.baseline_prompt}', memory_format=template")
             agg_base_i, res_base_i = evaluate_config(
                 files=files,
-                k=int(args.k),
                 memory_format="template",
-                model_name=args.model,
                 use_llm=bool(args.llm),
                 openai_model=args.llm_model,
                 openai_api_key=args.openai_api_key,
@@ -1424,9 +1339,7 @@ def main(argv: List[str] | None = None) -> int:
             print(f"  Evaluating current strategy='{args.current_prompt}', memory_format={args.memory_format}")
             agg_cur_i, res_cur_i = evaluate_config(
                 files=files,
-                k=int(args.k),
                 memory_format=args.memory_format,
-                model_name=args.model,
                 use_llm=bool(args.llm),
                 openai_model=args.llm_model,
                 openai_api_key=args.openai_api_key,
@@ -1521,7 +1434,7 @@ def main(argv: List[str] | None = None) -> int:
     if "avg_prompt_sizes" in agg_cur:
         viz_prompt_lengths(run_dir, agg_cur["avg_prompt_sizes"])  # focuses on current config’s prompts
 
-    # Note: Retrieval-only plots intentionally omitted in LLM-only mode.
+    # Note: only prompt-length and confusion plots are generated in this sequential-memory pipeline.
 
     # New: Confusion matrices by role (averaged across runs)
     cm_roles = sorted(set(list(agg_base.get("clf_by_role", {}).keys()) + list(agg_cur.get("clf_by_role", {}).keys())))

@@ -9,17 +9,10 @@ one memory-augmentation technique.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple, Optional
+from typing import Any, Dict, List
 import json
-import math
 import re
 from collections import defaultdict
-import os
-import hashlib
-
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import faiss
 
 
 @dataclass
@@ -209,111 +202,3 @@ def build_memory_entries(game: Dict, game_id: str, memory_format: str = "templat
     return entries
 
 
-# ---------- Embeddings and indexing ----------
-
-def build_embeddings(entries: List[MemoryEntry], model_name: str) -> Tuple[np.ndarray, Any]:
-    if SentenceTransformer is None:
-        raise ImportError("sentence-transformers is required. pip install -r requirements.txt")
-    # --- Performance knobs (override via env vars) ---
-    batch_size = int(os.getenv("EMBED_BATCH_SIZE", "64"))
-    use_cache = os.getenv("EMBED_CACHE", "1").strip().lower() not in ("0", "false", "no")
-    cache_dir = os.getenv("EMBED_CACHE_DIR", "outputs/cache/embeddings")
-    prefer_gpu = os.getenv("EMBED_USE_GPU", "1").strip().lower() not in ("0", "false", "no")
-
-    # Decide device (SentenceTransformer supports device=...)
-    device: Optional[str] = None
-    if prefer_gpu:
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                device = "cuda"
-        except Exception:
-            device = None
-
-    # Cache key: model + text contents
-    corpus = [e.text for e in entries]
-    cache_path: Optional[Path] = None
-    if use_cache:
-        try:
-            Path(cache_dir).mkdir(parents=True, exist_ok=True)
-            h = hashlib.sha256()
-            h.update(model_name.encode("utf-8"))
-            # Include length and a subset to avoid huge hashing cost
-            h.update(str(len(corpus)).encode("utf-8"))
-            for t in corpus[:64]:
-                h.update(t.encode("utf-8", errors="ignore"))
-            cache_path = Path(cache_dir) / f"emb_{h.hexdigest()[:16]}.npz"
-        except Exception:
-            cache_path = None
-
-    if cache_path is not None and cache_path.exists():
-        try:
-            data = np.load(str(cache_path))
-            emb = data["emb"].astype("float32")
-            # We still return a model handle because callers use it for query encoding.
-            model = SentenceTransformer(model_name, device=device) if device else SentenceTransformer(model_name)
-            return emb, model
-        except Exception:
-            pass
-
-    model = SentenceTransformer(model_name, device=device) if device else SentenceTransformer(model_name)
-    emb = model.encode(
-        corpus,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    emb = emb.astype("float32")
-
-    if cache_path is not None:
-        try:
-            np.savez_compressed(str(cache_path), emb=emb)
-        except Exception:
-            pass
-
-    return emb, model
-
-
-def build_faiss_ip_index(embeddings: np.ndarray) -> Any:
-    if faiss is None:
-        raise ImportError("faiss-cpu is required. pip install -r requirements.txt")
-    d = embeddings.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(embeddings)
-    return index
-
-
-def retrieve_top(index: Any, query_vec: np.ndarray, topn: int) -> Tuple[np.ndarray, np.ndarray]:
-    if query_vec.ndim == 1:
-        query_vec = query_vec[None, :]
-    D, I = index.search(query_vec.astype("float32"), topn)
-    return D[0], I[0]
-
-
-# ---------- Retrieval policies ----------
-
-def temporal_weight(score: float, target: MemoryEntry, candidate: MemoryEntry, alpha: float = 0.5) -> float:
-    dist = abs(int(target.quest) - int(candidate.quest))
-    if target.game_id != candidate.game_id:
-        dist += 2
-    return float(score) * math.exp(-alpha * float(dist))
-
-
-def rerank_temporal(entries: List[MemoryEntry], indices: Iterable[int], scores: Iterable[float], target_entry: MemoryEntry, alpha: float) -> List[Tuple[int, float]]:
-    pairs = []
-    for j, s in zip(indices, scores):
-        adj = temporal_weight(s, target_entry, entries[int(j)], alpha)
-        pairs.append((int(j), float(adj)))
-    pairs.sort(key=lambda x: -x[1])
-    return pairs
-
-
-def pca_2d(x: np.ndarray, center: bool = True) -> np.ndarray:
-    X = x.astype(np.float64)
-    if center:
-        X = X - X.mean(axis=0, keepdims=True)
-    U, S, Vt = np.linalg.svd(X, full_matrices=False)
-    comps = Vt[:2].T
-    return X @ comps

@@ -12,9 +12,9 @@ def assemble_prompt(target: MemoryEntry, retrieved: List[Tuple[MemoryEntry, floa
     parts.append("")
     parts.append(f"Target: GAME {target.game_id} | QUEST {target.quest}")
     parts.append("")
-    parts.append("Memory context (top-k similar rounds):")
+    parts.append("Memory context (past rounds from this game):")
     for i, (entry, score) in enumerate(retrieved, start=1):
-        parts.append(f"---- Memory {i} (cosine sim ~ {score:.3f}) | {entry.entry_id}")
+        parts.append(f"---- Memory {i} | {entry.entry_id}")
         parts.append(entry.text)
         parts.append("")
     parts.append("Your task: Provide an analysis or next-step reasoning for the target round using the context above.")
