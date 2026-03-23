@@ -9,14 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
-
-
-MATPLOTLIB_IMPORT_ERROR: str | None = None
-try:
-    import matplotlib.pyplot as plt
-except Exception as exc:  # pragma: no cover - environment-dependent import failure
-    plt = None  # type: ignore[assignment]
-    MATPLOTLIB_IMPORT_ERROR = str(exc)
+import plotly.graph_objects as go
 
 
 ROLE_ORDER = ["assassin", "merlin", "morgana", "percival", "servant-1", "servant-2"]
@@ -35,19 +28,7 @@ class Example:
 
 
 def _configure_plot_style() -> None:
-    if plt is None:
-        return
-    plt.rcParams.update(
-        {
-            "font.size": 16,
-            "axes.titlesize": 18,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 13,
-            "figure.titlesize": 20,
-        }
-    )
+    return
 
 
 def load_json(path: Path) -> Any:
@@ -200,38 +181,40 @@ def plot_distribution_comparison(
     out_pdf: Path,
     title: str,
 ) -> None:
-    y = np.arange(len(ROLE_ORDER))
-    h = 0.36
-
-    fig, ax = plt.subplots(figsize=(10, 5.8))
-    ax.barh(
-        y - h / 2,
-        true_means,
-        xerr=true_stds,
-        height=h,
-        label="True",
-        color="#4C78A8",
-        error_kw={"elinewidth": 1.2, "capsize": 3},
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=true_means,
+            y=ROLE_ORDER,
+            orientation="h",
+            name="True",
+            marker_color="#4C78A8",
+            error_x={"type": "data", "array": true_stds, "visible": True},
+        )
     )
-    ax.barh(
-        y + h / 2,
-        pred_means,
-        xerr=pred_stds,
-        height=h,
-        label="Predicted",
-        color="#F58518",
-        error_kw={"elinewidth": 1.2, "capsize": 3},
+    fig.add_trace(
+        go.Bar(
+            x=pred_means,
+            y=ROLE_ORDER,
+            orientation="h",
+            name="Predicted",
+            marker_color="#F58518",
+            error_x={"type": "data", "array": pred_stds, "visible": True},
+        )
     )
-    ax.set_yticks(y)
-    ax.set_yticklabels(ROLE_ORDER)
-    ax.set_xlabel("Count (mean across runs)")
-    ax.set_ylabel("Role")
-    ax.set_title(title)
-    ax.grid(axis="x", linestyle="--", alpha=0.35)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    fig.update_layout(
+        barmode="group",
+        title=title,
+        xaxis_title="Count (mean across runs)",
+        yaxis_title="Role",
+        template="plotly_white",
+        width=1050,
+        height=620,
+        margin={"l": 120, "r": 40, "t": 70, "b": 70},
+        font={"size": 16},
+        legend={"font": {"size": 13}},
+    )
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def plot_confusion_heatmap(conf: Dict[str, Dict[str, int]], out_pdf: Path, title: str) -> None:
@@ -239,26 +222,38 @@ def plot_confusion_heatmap(conf: Dict[str, Dict[str, int]], out_pdf: Path, title
     row_sums = m.sum(axis=1, keepdims=True)
     norm = np.divide(m, np.where(row_sums == 0, 1.0, row_sums))
 
-    fig, ax = plt.subplots(figsize=(12, 10))
-    im = ax.imshow(norm, cmap="Blues", vmin=0.0, vmax=1.0)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Row-normalized proportion", rotation=90, labelpad=16)
-    cbar.ax.tick_params(labelsize=11)
-
-    ax.set_xticks(np.arange(len(ROLE_ORDER)), labels=ROLE_ORDER, rotation=30, ha="right")
-    ax.set_yticks(np.arange(len(ROLE_ORDER)), labels=ROLE_ORDER)
-    ax.set_xlabel("Predicted role")
-    ax.set_ylabel("True role")
-    ax.set_title(title)
-
-    for i in range(len(ROLE_ORDER)):
-        for j in range(len(ROLE_ORDER)):
-            txt = f"{norm[i, j] * 100:.1f}%\n({int(m[i, j])})"
-            ax.text(j, i, txt, ha="center", va="center", color="black", fontsize=11)
-
-    fig.tight_layout(pad=1.1)
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    text = [[f"{norm[i, j] * 100:.1f}%<br>({int(m[i, j])})" for j in range(len(ROLE_ORDER))] for i in range(len(ROLE_ORDER))]
+    fig = go.Figure(
+        data=
+        [
+            go.Heatmap(
+                z=norm,
+                x=ROLE_ORDER,
+                y=ROLE_ORDER,
+                colorscale="Blues",
+                zmin=0.0,
+                zmax=1.0,
+                colorbar={"title": "Row-normalized proportion"},
+                text=text,
+                texttemplate="%{text}",
+                textfont={"size": 10, "color": "black"},
+                hovertemplate="True=%{y}<br>Pred=%{x}<br>Rate=%{z:.3f}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Predicted role",
+        yaxis_title="True role",
+        template="plotly_white",
+        width=1240,
+        height=1060,
+        margin={"l": 130, "r": 70, "t": 80, "b": 90},
+        font={"size": 14},
+    )
+    fig.update_xaxes(tickangle=30)
+    fig.update_yaxes(autorange="reversed")
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def plot_three_class_f1(
@@ -268,10 +263,7 @@ def plot_three_class_f1(
 ) -> None:
     classes = ["good", "evil", "merlin"]
     conds = list(metrics_by_condition.keys())
-    y = np.arange(len(classes))
-    h = 0.18 if len(conds) >= 4 else 0.24
-
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = go.Figure()
     for idx, cond in enumerate(conds):
         vals = np.array([metrics_by_condition[cond]["f1_by_class"].get(c, 0.0) for c in classes], dtype=float)
         runs = per_run_three_class.get(cond, [])
@@ -280,26 +272,29 @@ def plot_three_class_f1(
             errs = arr.std(axis=0)
         else:
             errs = np.zeros_like(vals)
-        ax.barh(
-            y + (idx - (len(conds) - 1) / 2) * h,
-            vals,
-            xerr=errs,
-            height=h,
-            label=cond,
-            error_kw={"elinewidth": 1.2, "capsize": 3},
+        fig.add_trace(
+            go.Bar(
+                x=vals,
+                y=classes,
+                orientation="h",
+                name=cond,
+                error_x={"type": "data", "array": errs, "visible": True},
+            )
         )
-
-    ax.set_yticks(y)
-    ax.set_yticklabels(classes)
-    ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("F1")
-    ax.set_ylabel("Grouped Class")
-    ax.set_title("3-Class F1 (good / evil / merlin)")
-    ax.grid(axis="x", linestyle="--", alpha=0.35)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    fig.update_layout(
+        barmode="group",
+        title="3-Class F1 (good / evil / merlin)",
+        xaxis_title="F1",
+        yaxis_title="Grouped Class",
+        template="plotly_white",
+        width=1060,
+        height=650,
+        margin={"l": 130, "r": 60, "t": 80, "b": 80},
+        xaxis={"range": [0.0, 1.0]},
+        font={"size": 16},
+        legend={"font": {"size": 13}},
+    )
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def _top_share(pred_counts: Counter[str], role: str) -> float:
@@ -362,25 +357,29 @@ def _extract_decision_stats(examples: Iterable[Example]) -> Dict[str, Any]:
 
 def plot_assassin_diagnostics(means: np.ndarray, stds: np.ndarray, out_pdf: Path) -> None:
     labels = ["q1", "q2", "q3", "q4+"]
-    y = np.arange(len(labels))
-
-    fig, ax = plt.subplots(figsize=(8.5, 4.8))
-    ax.barh(
-        y,
-        means,
-        xerr=stds,
-        color="#E45756",
-        error_kw={"elinewidth": 1.2, "capsize": 3},
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=means,
+                y=labels,
+                orientation="h",
+                marker_color="#E45756",
+                error_x={"type": "data", "array": stds, "visible": True},
+                showlegend=False,
+            )
+        ]
     )
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("Predicted assassin count (mean across runs)")
-    ax.set_ylabel("Quest Bucket")
-    ax.set_title("Belief+Social: Assassin Predictions by Quest Bucket")
-    ax.grid(axis="x", linestyle="--", alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    fig.update_layout(
+        title="Belief+Social: Assassin Predictions by Quest Bucket",
+        xaxis_title="Predicted assassin count (mean across runs)",
+        yaxis_title="Quest Bucket",
+        template="plotly_white",
+        width=900,
+        height=520,
+        margin={"l": 110, "r": 50, "t": 75, "b": 70},
+        font={"size": 15},
+    )
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def plot_micro_f1_boxplot(per_run_three_class: Dict[str, List[Dict[str, Any]]], out_pdf: Path) -> None:
@@ -396,15 +395,29 @@ def plot_micro_f1_boxplot(per_run_three_class: Dict[str, List[Dict[str, Any]]], 
     if not data:
         return
 
-    fig, ax = plt.subplots(figsize=(9.5, 5.2))
-    ax.boxplot(data, tick_labels=labels, vert=False, patch_artist=True)
-    ax.set_xlabel("3-class micro-F1")
-    ax.set_ylabel("Condition")
-    ax.set_title("Run-Level 3-Class Micro-F1 Distribution")
-    ax.grid(axis="x", linestyle="--", alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    fig = go.Figure()
+    for label, vals in zip(labels, data):
+        fig.add_trace(
+            go.Box(
+                x=vals,
+                y=[label] * len(vals),
+                orientation="h",
+                name=label,
+                boxpoints=False,
+                showlegend=False,
+            )
+        )
+    fig.update_layout(
+        title="Run-Level 3-Class Micro-F1 Distribution",
+        xaxis_title="3-class micro-F1",
+        yaxis_title="Condition",
+        template="plotly_white",
+        width=1080,
+        height=620,
+        margin={"l": 200, "r": 50, "t": 75, "b": 75},
+        font={"size": 15},
+    )
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def plot_role_bias_shift(
@@ -416,37 +429,42 @@ def plot_role_bias_shift(
 ) -> None:
     diff = belief_social_pred_share - baseline_pred_share
     err = np.sqrt(np.square(baseline_std) + np.square(belief_social_std))
-    y = np.arange(len(ROLE_ORDER))
-
-    fig, ax = plt.subplots(figsize=(9.5, 5.8))
     colors = ["#D62728" if d > 0 else "#1F77B4" for d in diff]
-    ax.barh(y, diff, xerr=err, color=colors, error_kw={"elinewidth": 1.2, "capsize": 3})
-    ax.axvline(0.0, color="black", linewidth=1.0)
-    ax.set_yticks(y)
-    ax.set_yticklabels(ROLE_ORDER)
-    ax.set_xlabel("Predicted role share shift (belief+social - baseline)")
-    ax.set_ylabel("Role")
-    ax.set_title("Prediction-Bias Shift by Role")
-    ax.grid(axis="x", linestyle="--", alpha=0.35)
-    fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", dpi=300)
-    plt.close(fig)
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=diff,
+                y=ROLE_ORDER,
+                orientation="h",
+                marker_color=colors,
+                error_x={"type": "data", "array": err, "visible": True},
+                showlegend=False,
+            )
+        ]
+    )
+    fig.add_vline(x=0.0, line_width=1.2, line_color="black")
+    fig.update_layout(
+        title="Prediction-Bias Shift by Role",
+        xaxis_title="Predicted role share shift (belief+social - baseline)",
+        yaxis_title="Role",
+        template="plotly_white",
+        width=1040,
+        height=620,
+        margin={"l": 140, "r": 50, "t": 75, "b": 80},
+        font={"size": 15},
+    )
+    fig.write_image(str(out_pdf), format="pdf", scale=2)
 
 
 def write_report(
     out_path: Path,
     baseline_examples: List[Example],
-    focus_examples: List[Example],
-    focus_label: str,
+    focus_sections: List[Tuple[str, List[Example]]],
     three_class: Dict[str, Dict[str, Any]],
 ) -> None:
     base_pred = Counter(ex.pred_role for ex in baseline_examples if ex.pred_role)
-    focus_pred = Counter(ex.pred_role for ex in focus_examples if ex.pred_role)
 
     base_true_break = _true_role_breakdown_for_pred(baseline_examples, "servant-1")
-    focus_top_role = max(focus_pred.items(), key=lambda x: x[1])[0] if focus_pred else "assassin"
-    focus_true_break = _true_role_breakdown_for_pred(focus_examples, focus_top_role)
-    focus_decisions = _extract_decision_stats(focus_examples)
 
     lines: List[str] = []
     lines.append("# Explainability Analysis Report")
@@ -460,19 +478,26 @@ def write_report(
     lines.append("  - Baseline tends to collapse toward a majority safe class when evidence is ambiguous.")
     lines.append("  - This is consistent with high confusion into servant classes in aggregate confusion matrices.")
     lines.append("")
-    lines.append(f"## 2) Focus behavior for {focus_label}")
-    lines.append(f"- Top predicted role: {focus_top_role}")
-    lines.append(f"- Share of top-role predictions: {(_top_share(focus_pred, focus_top_role)*100):.2f}%")
-    lines.append(f"- True-role composition among predictions labeled {focus_top_role}:")
-    for r in ROLE_ORDER:
-        lines.append(f"  - {r}: {focus_true_break.get(r, 0)}")
-    lines.append("- LLM post-processing/decision-path diagnostics:")
-    lines.append(f"  - used_repair_rate: {focus_decisions['used_repair_rate']:.3f}")
-    lines.append(f"  - proposer_override_rate: {focus_decisions['proposer_override_rate']:.3f}")
-    lines.append(f"  - fallback_reasons: {focus_decisions['fallback_reasons']}")
-    lines.append("- Interpretation:")
-    lines.append("  - High repair usage and strong post-processing influence can amplify one role decision path.")
-    lines.append("  - Read concentrated predictions as a system-level behavior (prompt + repair + proposer mapping), not only raw model intent.")
+    lines.append("## 2) Focus-technique behavior")
+    for focus_label, focus_examples in focus_sections:
+        focus_pred = Counter(ex.pred_role for ex in focus_examples if ex.pred_role)
+        focus_top_role = max(focus_pred.items(), key=lambda x: x[1])[0] if focus_pred else "assassin"
+        focus_true_break = _true_role_breakdown_for_pred(focus_examples, focus_top_role)
+        focus_decisions = _extract_decision_stats(focus_examples)
+
+        lines.append(f"### {focus_label}")
+        lines.append(f"- Top predicted role: {focus_top_role}")
+        lines.append(f"- Share of top-role predictions: {(_top_share(focus_pred, focus_top_role)*100):.2f}%")
+        lines.append(f"- True-role composition among predictions labeled {focus_top_role}:")
+        for r in ROLE_ORDER:
+            lines.append(f"  - {r}: {focus_true_break.get(r, 0)}")
+        lines.append("- LLM post-processing/decision-path diagnostics:")
+        lines.append(f"  - used_repair_rate: {focus_decisions['used_repair_rate']:.3f}")
+        lines.append(f"  - proposer_override_rate: {focus_decisions['proposer_override_rate']:.3f}")
+        lines.append(f"  - fallback_reasons: {focus_decisions['fallback_reasons']}")
+        lines.append("- Interpretation:")
+        lines.append("  - High repair usage and strong post-processing influence can amplify one role decision path.")
+        lines.append("  - Read concentrated predictions as a system-level behavior (prompt + repair + proposer mapping), not only raw model intent.")
     lines.append("")
     lines.append("## 3) F1 for good/evil/merlin")
     for cond, met in three_class.items():
@@ -485,9 +510,43 @@ def write_report(
     lines.append("")
     lines.append("## Notes")
     lines.append("- This report is computed from per-instance run outputs across all runs in each condition directory.")
-    lines.append("- Plot PDFs are generated with enlarged fonts for paper readability.")
+    lines.append("- Plot PDFs are generated with enlarged fonts and constrained layouts for paper readability.")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _plot_condition_bundle(
+    cond_label: str,
+    cond_slug: str,
+    cond_examples: List[Example],
+    cond_runs: List[List[Example]],
+    outdir: Path,
+) -> None:
+    true_arr = np.array([role_count_vector(run, source="true") for run in cond_runs], dtype=float)
+    pred_arr = np.array([role_count_vector(run, source="pred") for run in cond_runs], dtype=float)
+
+    plot_distribution_comparison(
+        true_arr.mean(axis=0),
+        true_arr.std(axis=0),
+        pred_arr.mean(axis=0),
+        pred_arr.std(axis=0),
+        outdir / f"{cond_slug}_true_vs_pred_distribution.pdf",
+        f"{cond_label}: True vs Predicted Role Distribution",
+    )
+
+    conf = count_confusion(cond_examples)
+    plot_confusion_heatmap(
+        conf,
+        outdir / f"{cond_slug}_confusion_heatmap.pdf",
+        f"{cond_label} Confusion Matrix (Row-normalized)",
+    )
+
+    assassin_bucket_arr = np.array([assassin_bucket_vector(run) for run in cond_runs], dtype=float)
+    plot_assassin_diagnostics(
+        assassin_bucket_arr.mean(axis=0),
+        assassin_bucket_arr.std(axis=0),
+        outdir / f"{cond_slug}_assassin_by_quest_bucket.pdf",
+    )
 
 
 def main() -> None:
@@ -528,16 +587,10 @@ def main() -> None:
         default=Path("outputs/analysis/explainability"),
         help="Directory where report and PDF plots are saved.",
     )
-    parser.add_argument(
-        "--skip-plots",
-        action="store_true",
-        help="Skip PDF plot generation (useful when matplotlib native extensions are blocked).",
-    )
     args = parser.parse_args()
 
     _configure_plot_style()
     args.outdir.mkdir(parents=True, exist_ok=True)
-    plots_enabled = (plt is not None) and (not args.skip_plots)
 
     baseline_examples = load_all_runs(args.baseline_exp, mode="baseline")
     vector_examples = load_all_runs(args.vector_exp, mode="current")
@@ -551,62 +604,33 @@ def main() -> None:
     belief_social_runs = load_runs_grouped(args.belief_social_exp, mode="current")
     self_note_runs = load_runs_grouped(args.self_note_exp, mode="current") if args.self_note_exp else []
 
-    focus_label = "belief_vector+social"
-    focus_examples = belief_social_examples
-    focus_runs = belief_social_runs
-    focus_slug = "belief_social"
-    if args.self_note_exp:
-        focus_label = "llm_self_note"
-        focus_examples = self_note_examples
-        focus_runs = self_note_runs
-        focus_slug = "self_note"
-
     # Q1: baseline servant-1 collapse
     base_true_arr = np.array([role_count_vector(run, source="true") for run in baseline_runs], dtype=float)
     base_pred_arr = np.array([role_count_vector(run, source="pred") for run in baseline_runs], dtype=float)
-    if plots_enabled:
-        plot_distribution_comparison(
-            base_true_arr.mean(axis=0),
-            base_true_arr.std(axis=0),
-            base_pred_arr.mean(axis=0),
-            base_pred_arr.std(axis=0),
-            args.outdir / "baseline_true_vs_pred_distribution.pdf",
-            "Baseline: True vs Predicted Role Distribution",
-        )
+    plot_distribution_comparison(
+        base_true_arr.mean(axis=0),
+        base_true_arr.std(axis=0),
+        base_pred_arr.mean(axis=0),
+        base_pred_arr.std(axis=0),
+        args.outdir / "baseline_true_vs_pred_distribution.pdf",
+        "Baseline: True vs Predicted Role Distribution",
+    )
     baseline_conf = count_confusion(baseline_examples)
-    if plots_enabled:
-        plot_confusion_heatmap(
-            baseline_conf,
-            args.outdir / "baseline_confusion_heatmap.pdf",
-            "Baseline Confusion Matrix (Row-normalized)",
-        )
+    plot_confusion_heatmap(
+        baseline_conf,
+        args.outdir / "baseline_confusion_heatmap.pdf",
+        "Baseline Confusion Matrix (Row-normalized)",
+    )
 
-    # Q2: focus-condition concentration diagnostics
-    bs_true_arr = np.array([role_count_vector(run, source="true") for run in focus_runs], dtype=float)
-    bs_pred_arr = np.array([role_count_vector(run, source="pred") for run in focus_runs], dtype=float)
-    if plots_enabled:
-        plot_distribution_comparison(
-            bs_true_arr.mean(axis=0),
-            bs_true_arr.std(axis=0),
-            bs_pred_arr.mean(axis=0),
-            bs_pred_arr.std(axis=0),
-            args.outdir / f"{focus_slug}_true_vs_pred_distribution.pdf",
-            f"{focus_label}: True vs Predicted Role Distribution",
-        )
-    bs_conf = count_confusion(focus_examples)
-    if plots_enabled:
-        plot_confusion_heatmap(
-            bs_conf,
-            args.outdir / f"{focus_slug}_confusion_heatmap.pdf",
-            f"{focus_label} Confusion Matrix (Row-normalized)",
-        )
-    assassin_bucket_arr = np.array([assassin_bucket_vector(run) for run in focus_runs], dtype=float)
-    if plots_enabled:
-        plot_assassin_diagnostics(
-            assassin_bucket_arr.mean(axis=0),
-            assassin_bucket_arr.std(axis=0),
-            args.outdir / f"{focus_slug}_assassin_by_quest_bucket.pdf",
-        )
+    # Q2: concentration diagnostics for all focus techniques
+    focus_conditions: List[Tuple[str, str, List[Example], List[List[Example]]]] = [
+        ("belief_vector+social", "belief_social", belief_social_examples, belief_social_runs),
+    ]
+    if args.self_note_exp:
+        focus_conditions.append(("llm_self_note", "self_note", self_note_examples, self_note_runs))
+
+    for cond_label, cond_slug, cond_examples, cond_runs in focus_conditions:
+        _plot_condition_bundle(cond_label, cond_slug, cond_examples, cond_runs, args.outdir)
 
     # Q3: 3-class good/evil/merlin F1 for all focused conditions
     conditions: List[Tuple[str, List[Example], List[List[Example]]]] = [
@@ -620,41 +644,45 @@ def main() -> None:
 
     three_class = {name: three_class_metrics(exs) for name, exs, _ in conditions}
     per_run_three_class = {name: [three_class_metrics(run) for run in runs] for name, _, runs in conditions}
-    if plots_enabled:
-        plot_three_class_f1(three_class, per_run_three_class, args.outdir / "three_class_f1_comparison.pdf")
-        plot_micro_f1_boxplot(per_run_three_class, args.outdir / "three_class_micro_f1_boxplot.pdf")
+    plot_three_class_f1(three_class, per_run_three_class, args.outdir / "three_class_f1_comparison.pdf")
+    plot_micro_f1_boxplot(per_run_three_class, args.outdir / "three_class_micro_f1_boxplot.pdf")
 
     base_share_arr = np.array([role_share_vector(run, source="pred") for run in baseline_runs], dtype=float)
-    bs_share_arr = np.array([role_share_vector(run, source="pred") for run in focus_runs], dtype=float)
-    if plots_enabled:
+    bs_share_arr = np.array([role_share_vector(run, source="pred") for run in belief_social_runs], dtype=float)
+    plot_role_bias_shift(
+        base_share_arr.mean(axis=0),
+        bs_share_arr.mean(axis=0),
+        base_share_arr.std(axis=0),
+        bs_share_arr.std(axis=0),
+        args.outdir / "role_bias_shift_baseline_vs_belief_social.pdf",
+    )
+    if args.self_note_exp:
+        sn_share_arr = np.array([role_share_vector(run, source="pred") for run in self_note_runs], dtype=float)
         plot_role_bias_shift(
             base_share_arr.mean(axis=0),
-            bs_share_arr.mean(axis=0),
+            sn_share_arr.mean(axis=0),
             base_share_arr.std(axis=0),
-            bs_share_arr.std(axis=0),
-            args.outdir / f"role_bias_shift_baseline_vs_{focus_slug}.pdf",
+            sn_share_arr.std(axis=0),
+            args.outdir / "role_bias_shift_baseline_vs_self_note.pdf",
         )
 
     write_report(
         args.outdir / "analysis_report.md",
         baseline_examples,
-        focus_examples,
-        focus_label,
+        [("belief_vector+social", belief_social_examples)]
+        + ([("llm_self_note", self_note_examples)] if args.self_note_exp else []),
         three_class,
     )
 
     summary = {
         "baseline_n": len(baseline_examples),
-        f"{focus_slug}_n": len(focus_examples),
-        "focus_label": focus_label,
+        "belief_social_n": len(belief_social_examples),
         "three_class_metrics": three_class,
         "output_dir": str(args.outdir),
     }
+    if args.self_note_exp:
+        summary["self_note_n"] = len(self_note_examples)
     (args.outdir / "summary_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    if not plots_enabled:
-        reason = "--skip-plots flag" if args.skip_plots else f"matplotlib unavailable: {MATPLOTLIB_IMPORT_ERROR}"
-        print(f"Plot generation skipped ({reason}).")
 
     print(f"Saved analysis to: {args.outdir}")
     print("Generated files:")
