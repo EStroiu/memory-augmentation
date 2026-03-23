@@ -8,8 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
+
+
+MATPLOTLIB_IMPORT_ERROR: str | None = None
+try:
+    import matplotlib.pyplot as plt
+except Exception as exc:  # pragma: no cover - environment-dependent import failure
+    plt = None  # type: ignore[assignment]
+    MATPLOTLIB_IMPORT_ERROR = str(exc)
 
 
 ROLE_ORDER = ["assassin", "merlin", "morgana", "percival", "servant-1", "servant-2"]
@@ -28,6 +35,8 @@ class Example:
 
 
 def _configure_plot_style() -> None:
+    if plt is None:
+        return
     plt.rcParams.update(
         {
             "font.size": 16,
@@ -519,10 +528,16 @@ def main() -> None:
         default=Path("outputs/analysis/explainability"),
         help="Directory where report and PDF plots are saved.",
     )
+    parser.add_argument(
+        "--skip-plots",
+        action="store_true",
+        help="Skip PDF plot generation (useful when matplotlib native extensions are blocked).",
+    )
     args = parser.parse_args()
 
     _configure_plot_style()
     args.outdir.mkdir(parents=True, exist_ok=True)
+    plots_enabled = (plt is not None) and (not args.skip_plots)
 
     baseline_examples = load_all_runs(args.baseline_exp, mode="baseline")
     vector_examples = load_all_runs(args.vector_exp, mode="current")
@@ -549,44 +564,49 @@ def main() -> None:
     # Q1: baseline servant-1 collapse
     base_true_arr = np.array([role_count_vector(run, source="true") for run in baseline_runs], dtype=float)
     base_pred_arr = np.array([role_count_vector(run, source="pred") for run in baseline_runs], dtype=float)
-    plot_distribution_comparison(
-        base_true_arr.mean(axis=0),
-        base_true_arr.std(axis=0),
-        base_pred_arr.mean(axis=0),
-        base_pred_arr.std(axis=0),
-        args.outdir / "baseline_true_vs_pred_distribution.pdf",
-        "Baseline: True vs Predicted Role Distribution",
-    )
+    if plots_enabled:
+        plot_distribution_comparison(
+            base_true_arr.mean(axis=0),
+            base_true_arr.std(axis=0),
+            base_pred_arr.mean(axis=0),
+            base_pred_arr.std(axis=0),
+            args.outdir / "baseline_true_vs_pred_distribution.pdf",
+            "Baseline: True vs Predicted Role Distribution",
+        )
     baseline_conf = count_confusion(baseline_examples)
-    plot_confusion_heatmap(
-        baseline_conf,
-        args.outdir / "baseline_confusion_heatmap.pdf",
-        "Baseline Confusion Matrix (Row-normalized)",
-    )
+    if plots_enabled:
+        plot_confusion_heatmap(
+            baseline_conf,
+            args.outdir / "baseline_confusion_heatmap.pdf",
+            "Baseline Confusion Matrix (Row-normalized)",
+        )
 
     # Q2: focus-condition concentration diagnostics
     bs_true_arr = np.array([role_count_vector(run, source="true") for run in focus_runs], dtype=float)
     bs_pred_arr = np.array([role_count_vector(run, source="pred") for run in focus_runs], dtype=float)
-    plot_distribution_comparison(
-        bs_true_arr.mean(axis=0),
-        bs_true_arr.std(axis=0),
-        bs_pred_arr.mean(axis=0),
-        bs_pred_arr.std(axis=0),
-        args.outdir / f"{focus_slug}_true_vs_pred_distribution.pdf",
-        f"{focus_label}: True vs Predicted Role Distribution",
-    )
+    if plots_enabled:
+        plot_distribution_comparison(
+            bs_true_arr.mean(axis=0),
+            bs_true_arr.std(axis=0),
+            bs_pred_arr.mean(axis=0),
+            bs_pred_arr.std(axis=0),
+            args.outdir / f"{focus_slug}_true_vs_pred_distribution.pdf",
+            f"{focus_label}: True vs Predicted Role Distribution",
+        )
     bs_conf = count_confusion(focus_examples)
-    plot_confusion_heatmap(
-        bs_conf,
-        args.outdir / f"{focus_slug}_confusion_heatmap.pdf",
-        f"{focus_label} Confusion Matrix (Row-normalized)",
-    )
+    if plots_enabled:
+        plot_confusion_heatmap(
+            bs_conf,
+            args.outdir / f"{focus_slug}_confusion_heatmap.pdf",
+            f"{focus_label} Confusion Matrix (Row-normalized)",
+        )
     assassin_bucket_arr = np.array([assassin_bucket_vector(run) for run in focus_runs], dtype=float)
-    plot_assassin_diagnostics(
-        assassin_bucket_arr.mean(axis=0),
-        assassin_bucket_arr.std(axis=0),
-        args.outdir / f"{focus_slug}_assassin_by_quest_bucket.pdf",
-    )
+    if plots_enabled:
+        plot_assassin_diagnostics(
+            assassin_bucket_arr.mean(axis=0),
+            assassin_bucket_arr.std(axis=0),
+            args.outdir / f"{focus_slug}_assassin_by_quest_bucket.pdf",
+        )
 
     # Q3: 3-class good/evil/merlin F1 for all focused conditions
     conditions: List[Tuple[str, List[Example], List[List[Example]]]] = [
@@ -600,18 +620,20 @@ def main() -> None:
 
     three_class = {name: three_class_metrics(exs) for name, exs, _ in conditions}
     per_run_three_class = {name: [three_class_metrics(run) for run in runs] for name, _, runs in conditions}
-    plot_three_class_f1(three_class, per_run_three_class, args.outdir / "three_class_f1_comparison.pdf")
-    plot_micro_f1_boxplot(per_run_three_class, args.outdir / "three_class_micro_f1_boxplot.pdf")
+    if plots_enabled:
+        plot_three_class_f1(three_class, per_run_three_class, args.outdir / "three_class_f1_comparison.pdf")
+        plot_micro_f1_boxplot(per_run_three_class, args.outdir / "three_class_micro_f1_boxplot.pdf")
 
     base_share_arr = np.array([role_share_vector(run, source="pred") for run in baseline_runs], dtype=float)
     bs_share_arr = np.array([role_share_vector(run, source="pred") for run in focus_runs], dtype=float)
-    plot_role_bias_shift(
-        base_share_arr.mean(axis=0),
-        bs_share_arr.mean(axis=0),
-        base_share_arr.std(axis=0),
-        bs_share_arr.std(axis=0),
-        args.outdir / f"role_bias_shift_baseline_vs_{focus_slug}.pdf",
-    )
+    if plots_enabled:
+        plot_role_bias_shift(
+            base_share_arr.mean(axis=0),
+            bs_share_arr.mean(axis=0),
+            base_share_arr.std(axis=0),
+            bs_share_arr.std(axis=0),
+            args.outdir / f"role_bias_shift_baseline_vs_{focus_slug}.pdf",
+        )
 
     write_report(
         args.outdir / "analysis_report.md",
@@ -629,6 +651,10 @@ def main() -> None:
         "output_dir": str(args.outdir),
     }
     (args.outdir / "summary_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    if not plots_enabled:
+        reason = "--skip-plots flag" if args.skip_plots else f"matplotlib unavailable: {MATPLOTLIB_IMPORT_ERROR}"
+        print(f"Plot generation skipped ({reason}).")
 
     print(f"Saved analysis to: {args.outdir}")
     print("Generated files:")
