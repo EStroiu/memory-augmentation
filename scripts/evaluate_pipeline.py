@@ -57,6 +57,12 @@ from scripts.vector_memory import (
     parse_party_and_outcome_from_msgs,
     summarize_state,
 )
+from scripts.self_note_memory import (
+    parse_role_note_json as _parse_role_note_json,
+    normalize_memory_note as _normalize_memory_note,
+    build_llm_self_note_prompt,
+    postprocess_typechat_role_note,
+)
 
 @dataclass
 class ExperimentConfig:
@@ -480,6 +486,15 @@ def prompt_vector_memory_social(
     return prompt, meta
 
 
+@register_prompt("llm_self_note")
+def prompt_llm_self_note(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    return build_llm_self_note_prompt(target, retrieved, ctx)
+
+
 @register_llm_post("none")
 def llm_post_none(
     raw_pred: Optional[str],
@@ -727,6 +742,15 @@ def llm_post_typechat_beliefs(
     }
 
 
+@register_llm_post("typechat_role_note")
+def llm_post_typechat_role_note(
+    raw_pred: Optional[str],
+    valid_roles: List[str],
+    ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+    return postprocess_typechat_role_note(raw_pred, valid_roles, ctx)
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -793,6 +817,9 @@ def evaluate_config(
     # For vector_memory prompt: per-game vector states
     vector_state_by_game: Dict[str, Any] = {}
 
+    # For llm_self_note prompt: rolling model-authored note per game
+    rolling_note_by_game: Dict[str, str] = {}
+
     # LLM fixer statistics
     fixer_total_calls: int = 0
     fixer_used_repair: int = 0
@@ -840,6 +867,7 @@ def evaluate_config(
             "belief_confidence_by_game": belief_confidence_by_game,
             "valid_roles": valid_roles,
             "vector_state_by_game": vector_state_by_game,
+            "rolling_note_by_game": rolling_note_by_game,
         }
 
         prompt_fn = PROMPT_REGISTRY.get(prompt_name)
@@ -865,8 +893,13 @@ def evaluate_config(
             "social_cues_enabled": bool((prompt_meta or {}).get("social_cues_enabled", False)) if isinstance(prompt_meta, dict) else False,
             "social_total_detected_flips": int((social_cues_meta or {}).get("total_detected_flips", 0)) if isinstance(social_cues_meta, dict) else 0,
             "vector_memory_heuristics_explained_in_prompt": "Heuristics used to compute this memory:" in llm_prompt_text,
+            "self_note_enabled": str(strategy_mode) == "llm_self_note",
             "task_schema_enforced": True,
-            "task_schema": '{"role": "<ROLE>"}',
+            "task_schema": (
+                '{"role":"<ROLE>","memory_note":"<UPDATED_NOTE>"}'
+                if str(strategy_mode) == "llm_self_note"
+                else '{"role": "<ROLE>"}'
+            ),
         }
 
         # For backwards-compatible stats, treat this single prompt as both baseline and with-memory.
@@ -934,6 +967,7 @@ def evaluate_config(
         processed_used_repair: bool = False
         processed_beliefs_preview: str | None = None
         proposer_from_beliefs: str | None = None
+        memory_note_next: str | None = None
         if bool(use_llm):
             raw_pred = llm_out.get("prediction")
             post_fn = LLM_POST_REGISTRY.get(llm_fixer)
@@ -964,6 +998,16 @@ def evaluate_config(
                 fixer_fallback_reasons[null_reason] += 1
             processed_beliefs_preview = post_out.get("beliefs_preview")
             proposer_from_beliefs = post_out.get("proposer_from_beliefs")
+            memory_note_next = post_out.get("memory_note_next") if isinstance(post_out.get("memory_note_next"), str) else None
+
+            # If fixer does not expose note fields, still attempt raw extraction so
+            # llm_self_note can evolve state round-by-round.
+            if memory_note_next is None and str(heuristics_info.get("strategy_mode")) == "llm_self_note":
+                memory_note_next = _normalize_memory_note(_parse_role_note_json(raw_pred).get("memory_note"))
+
+            # Update rolling LLM-authored note for this game when provided.
+            if memory_note_next is not None:
+                rolling_note_by_game[str(target.game_id)] = memory_note_next
         else:
             # Fallback heuristic: transfer proposer role from most recent prior round in same game
             if len(sequential_memory_idx) > 0:
@@ -1075,6 +1119,7 @@ def evaluate_config(
                 "llm_error": llm_out.get("error") or llm_out.get("note"),
                 "llm_warning": llm_out.get("warning") or llm_out.get("truncated"),
                 "llm_duration_s": llm_out.get("duration_s"),
+                "memory_note_chars": len(memory_note_next) if isinstance(memory_note_next, str) else 0,
                 "true_role": true_role,
                 "pred_role": pred_role,
             },
@@ -1094,6 +1139,8 @@ def evaluate_config(
                 "used_repair": bool(processed_used_repair),
                 "repair_attempted": bool(post_out.get("repair_attempted")),
                 "repaired_preview": post_out.get("repaired_preview"),
+                "memory_note_next": memory_note_next,
+                "memory_note_next_chars": len(memory_note_next) if isinstance(memory_note_next, str) else 0,
                 # Only include beliefs fields when beliefs fixer is active
                 **(
                     {
@@ -1164,6 +1211,10 @@ def evaluate_config(
         ),
         "avg_social_detected_flips": (
             float(np.mean([r.get("heuristics", {}).get("social_total_detected_flips", 0) for r in results])) if results else 0.0
+        ),
+        "self_note_enabled": str(prompt_name) == "llm_self_note",
+        "avg_self_note_chars": (
+            float(np.mean([r.get("log_row", {}).get("memory_note_chars", 0) for r in results])) if results else 0.0
         ),
     }
 
@@ -1236,7 +1287,7 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--llm_fixer", type=str, default="none", choices=list(LLM_POST_REGISTRY.keys()), help="How to post-process LLM JSON output (TypeChat repair, etc.).")
     ap.add_argument("--llm_fixer_baseline", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional baseline-only LLM fixer (overrides --llm_fixer for baseline).")
     ap.add_argument("--llm_fixer_current", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional current-only LLM fixer (overrides --llm_fixer for current).")
-    ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary"], help="Named experiment preset. 'custom' uses provided arguments.")
+    ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary", "baseline_vs_self_note"], help="Named experiment preset. 'custom' uses provided arguments.")
 
     # LLM logging / reproducibility
     ap.add_argument("--save_llm_io", action="store_true", help="Save full LLM prompts/responses (including repair calls) into results JSON (large files)")
@@ -1254,6 +1305,12 @@ def main(argv: List[str] | None = None) -> int:
     elif args.exp == "baseline_vs_template+summary":
         args.baseline_prompt = "baseline_full_transcript"
         args.current_prompt = "mem_template+summary"
+    elif args.exp == "baseline_vs_self_note":
+        args.baseline_prompt = "baseline_full_transcript"
+        args.current_prompt = "llm_self_note"
+        # This fixer parses both role and updated running note.
+        if not args.llm_fixer_current:
+            args.llm_fixer_current = "typechat_role_note"
 
     # Default behavior: if using LLM, save IO unless explicitly disabled.
     save_llm_io = bool(args.save_llm_io) or (bool(args.llm) and not bool(args.no_save_llm_io))
