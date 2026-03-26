@@ -378,7 +378,7 @@ def prompt_belief_vector_social(
         current_transcript=current_transcript,
         valid_roles=ctx["valid_roles"],
         social_cues=social_block,
-        reasoning_mode="hypothesis",
+        reasoning_mode="standard",
     )
     meta["mode"] = "belief_vector_social"
     meta["social_cues_enabled"] = True
