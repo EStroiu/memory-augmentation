@@ -8,17 +8,28 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Set, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
 
 
 ROLE_ORDER = ["assassin", "merlin", "morgana", "percival", "servant-1", "servant-2"]
-EVIL_ROLES = {"assassin", "morgana"}
-GOOD_ROLES = {"percival", "servant-1", "servant-2"}
+EVIL_ROLES: Set[str] = {"assassin", "morgana"}
+GOOD_ROLES: Set[str] = {"percival", "servant-1", "servant-2"}
+MERLIN_ROLE = "merlin"
 
 PAPER_FONT = "Times New Roman"
+PAPER_COLORS = [
+    "#4C78A8",
+    "#F58518",
+    "#54A24B",
+    "#E45756",
+    "#72B7B2",
+    "#EECA3B",
+    "#B279A2",
+    "#FF9DA6",
+]
 
 
 def _paper_layout(title: str, width: int, height: int, left: int = 110, right: int = 35, top: int = 58, bottom: int = 58) -> Dict[str, Any]:
@@ -30,6 +41,13 @@ def _paper_layout(title: str, width: int, height: int, left: int = 110, right: i
         "margin": {"l": left, "r": right, "t": top, "b": bottom},
         "font": {"family": PAPER_FONT, "size": 12},
     }
+
+
+def _color_for_label(label: str, ordered_labels: List[str]) -> str:
+    if not ordered_labels:
+        return PAPER_COLORS[0]
+    idx = max(0, ordered_labels.index(label)) if label in ordered_labels else 0
+    return PAPER_COLORS[idx % len(PAPER_COLORS)]
 
 
 @dataclass
@@ -65,6 +83,103 @@ def _slugify(s: str) -> str:
 def _folder_timestamp_prefix(name: str) -> str:
     m = _TS_RE.match(name)
     return m.group(1) if m else "unknown-time"
+
+
+def _parse_csv_items(text: str | None) -> List[str]:
+    if not text:
+        return []
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def _infer_roles_from_bundles(bundles: List[ConditionBundle]) -> List[str]:
+    seen: Dict[str, None] = {}
+    for b in bundles:
+        for ex in b.examples:
+            if isinstance(ex.true_role, str) and ex.true_role:
+                seen.setdefault(ex.true_role, None)
+            if isinstance(ex.pred_role, str) and ex.pred_role:
+                seen.setdefault(ex.pred_role, None)
+    return sorted(seen.keys())
+
+
+def _set_role_globals(role_order: List[str], evil_roles: Set[str], good_roles: Set[str], merlin_role: str) -> None:
+    global ROLE_ORDER, EVIL_ROLES, GOOD_ROLES, MERLIN_ROLE
+    ROLE_ORDER = list(role_order)
+    EVIL_ROLES = set(evil_roles)
+    GOOD_ROLES = set(good_roles)
+    MERLIN_ROLE = str(merlin_role)
+
+
+def _resolve_role_config(
+    bundles: List[ConditionBundle],
+    role_order_arg: str | None,
+    evil_roles_arg: str | None,
+    good_roles_arg: str | None,
+    merlin_role_arg: str,
+    safe_role_arg: str | None,
+    focus_role_arg: str | None,
+) -> Dict[str, Any]:
+    inferred_roles = _infer_roles_from_bundles(bundles)
+
+    role_order_cli = _parse_csv_items(role_order_arg)
+    if role_order_cli:
+        role_order = list(dict.fromkeys(role_order_cli + [r for r in inferred_roles if r not in role_order_cli]))
+    elif inferred_roles:
+        role_order = inferred_roles
+    else:
+        role_order = list(ROLE_ORDER)
+
+    evil_roles_cli = set(_parse_csv_items(evil_roles_arg))
+    if evil_roles_cli:
+        evil_roles = {r for r in evil_roles_cli if r in role_order}
+    else:
+        evil_roles = {r for r in EVIL_ROLES if r in role_order}
+
+    merlin_role = str(merlin_role_arg).strip() if merlin_role_arg else MERLIN_ROLE
+    if merlin_role and merlin_role not in role_order:
+        merlin_role = ""
+
+    good_roles_cli = set(_parse_csv_items(good_roles_arg))
+    if good_roles_cli:
+        good_roles = {r for r in good_roles_cli if r in role_order}
+    else:
+        good_roles = {r for r in role_order if r not in evil_roles and r != merlin_role}
+
+    baseline_bundle = _latest_by_technique(bundles, "baseline_full_transcript")
+    baseline_examples = baseline_bundle.examples if baseline_bundle is not None else []
+
+    if safe_role_arg and safe_role_arg in role_order:
+        safe_role = str(safe_role_arg)
+    elif "servant-1" in role_order:
+        safe_role = "servant-1"
+    elif "servant" in role_order:
+        safe_role = "servant"
+    else:
+        pred_counts = Counter(ex.pred_role for ex in baseline_examples if ex.pred_role in role_order)
+        if good_roles:
+            good_pred = [(r, pred_counts.get(r, 0)) for r in good_roles]
+            safe_role = max(good_pred, key=lambda x: x[1])[0]
+        else:
+            safe_role = role_order[0]
+
+    if focus_role_arg and focus_role_arg in role_order:
+        focus_role = str(focus_role_arg)
+    elif "assassin" in role_order:
+        focus_role = "assassin"
+    elif evil_roles:
+        focus_role = sorted(list(evil_roles))[0]
+    else:
+        focus_role = role_order[0]
+
+    _set_role_globals(role_order, evil_roles, good_roles, merlin_role)
+    return {
+        "role_order": role_order,
+        "evil_roles": sorted(list(evil_roles)),
+        "good_roles": sorted(list(good_roles)),
+        "merlin_role": merlin_role,
+        "safe_role": safe_role,
+        "focus_role": focus_role,
+    }
 
 
 def _safe_mean_std(arr: np.ndarray, width: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -271,9 +386,15 @@ def role_share_vector(examples: Iterable[Example], source: str) -> np.ndarray:
     return vec / s if s > 0 else vec
 
 
-def assassin_bucket_vector(examples: Iterable[Example]) -> np.ndarray:
-    by_q = _bucket_by_quest(examples, "assassin")
+def role_bucket_vector(examples: Iterable[Example], role: str) -> np.ndarray:
+    by_q = _bucket_by_quest(examples, role)
     return np.array([float(by_q[k]) for k in ["q1", "q2", "q3", "q4+"]], dtype=float)
+
+
+def role_bucket_share_vector(examples: Iterable[Example], role: str) -> np.ndarray:
+    vec = role_bucket_vector(examples, role)
+    s = float(vec.sum())
+    return (vec / s) if s > 0 else vec
 
 
 def safe_div(a: float, b: float) -> float:
@@ -463,7 +584,7 @@ def per_class_f1(true_labels: List[str], pred_labels: List[str], labels: List[st
 def role_to_three_class(role: str | None) -> str | None:
     if role is None:
         return None
-    if role == "merlin":
+    if MERLIN_ROLE and role == MERLIN_ROLE:
         return "merlin"
     if role in EVIL_ROLES:
         return "evil"
@@ -533,9 +654,16 @@ def plot_distribution_comparison(
     fig.update_layout(
         **_paper_layout(title=title, width=980, height=420, left=130, top=62, bottom=62),
         barmode="group",
-        xaxis_title="Count (mean across runs)",
+        xaxis_title="Role share (mean across runs)",
         yaxis_title="Role",
-        legend={"font": {"family": PAPER_FONT, "size": 11}, "orientation": "h", "y": 1.08, "x": 0.0},
+        legend={
+            "font": {"family": PAPER_FONT, "size": 11},
+            "orientation": "h",
+            "y": 1.08,
+            "x": 0.0,
+            "traceorder": "reversed",
+        },
+        xaxis={"range": [0.0, 1.0]},
     )
     fig.write_image(str(out_pdf), format="pdf", scale=2)
 
@@ -597,6 +725,7 @@ def plot_three_class_f1(
     )
 
     fig = go.Figure()
+    cond_colors = {c: _color_for_label(c, conds) for c in conds}
     for cond in conds:
         vals = np.array([metrics_by_condition[cond]["f1_by_class"].get(c, 0.0) for c in classes], dtype=float)
         runs = per_run_three_class.get(cond, [])
@@ -611,12 +740,13 @@ def plot_three_class_f1(
                 y=classes,
                 orientation="h",
                 name=cond,
+                marker_color=cond_colors[cond],
                 error_x={"type": "data", "array": errs, "visible": True},
             )
         )
     fig.update_layout(
         **_paper_layout(
-            title="3-Class F1 (good / evil / merlin)",
+            title=f"3-Class F1 (good / evil / {MERLIN_ROLE or 'merlin'})",
             width=980,
             height=fig_height,
             left=125,
@@ -634,6 +764,7 @@ def plot_three_class_f1(
             "y": 1.08,
             "x": 0.0,
             "xanchor": "left",
+            "traceorder": "reversed",
         },
     )
     fig.write_image(str(out_pdf), format="pdf", scale=2)
@@ -697,7 +828,7 @@ def _extract_decision_stats(examples: Iterable[Example]) -> Dict[str, Any]:
     return stats
 
 
-def plot_assassin_diagnostics(means: np.ndarray, stds: np.ndarray, out_pdf: Path) -> None:
+def plot_role_diagnostics(means: np.ndarray, stds: np.ndarray, out_pdf: Path, role_name: str) -> None:
     labels = ["q1", "q2", "q3", "q4+"]
     fig = go.Figure(
         data=[
@@ -712,9 +843,10 @@ def plot_assassin_diagnostics(means: np.ndarray, stds: np.ndarray, out_pdf: Path
         ]
     )
     fig.update_layout(
-        **_paper_layout(title="Belief+Social: Assassin Predictions by Quest Bucket", width=880, height=360, left=120, right=35, top=58, bottom=56),
-        xaxis_title="Predicted assassin count (mean across runs)",
+        **_paper_layout(title=f"Belief+Social: {role_name} Predictions by Quest Bucket", width=880, height=360, left=120, right=35, top=58, bottom=56),
+        xaxis_title=f"Share of predicted {role_name} by quest bucket",
         yaxis_title="Quest Bucket",
+        xaxis={"range": [0.0, 1.0]},
     )
     fig.write_image(str(out_pdf), format="pdf", scale=2)
 
@@ -743,6 +875,7 @@ def plot_micro_f1_boxplot(per_run_three_class: Dict[str, List[Dict[str, Any]]], 
     )
 
     fig = go.Figure()
+    cond_colors = {c: _color_for_label(c, labels) for c in labels}
     for label, vals in zip(labels, data):
         fig.add_trace(
             go.Box(
@@ -750,6 +883,7 @@ def plot_micro_f1_boxplot(per_run_three_class: Dict[str, List[Dict[str, Any]]], 
                 y=[label] * len(vals),
                 orientation="h",
                 name=label,
+                marker_color=cond_colors[label],
                 boxpoints=False,
                 showlegend=False,
             )
@@ -806,18 +940,20 @@ def write_report(
     baseline_examples: List[Example],
     focus_sections: List[Tuple[str, List[Example]]],
     three_class: Dict[str, Dict[str, Any]],
+    safe_role: str,
+    focus_role: str,
     hypothesis_tests: Dict[str, Any] | None = None,
 ) -> None:
     base_pred = Counter(ex.pred_role for ex in baseline_examples if ex.pred_role)
 
-    base_true_break = _true_role_breakdown_for_pred(baseline_examples, "servant-1")
+    base_true_break = _true_role_breakdown_for_pred(baseline_examples, safe_role)
 
     lines: List[str] = []
     lines.append("# Explainability Analysis Report")
     lines.append("")
-    lines.append("## 1) Why baseline focuses on servant-1")
-    lines.append(f"- Share of servant-1 predictions: {(_top_share(base_pred, 'servant-1')*100):.2f}%")
-    lines.append("- True-role composition among predictions labeled servant-1:")
+    lines.append(f"## 1) Why baseline focuses on {safe_role}")
+    lines.append(f"- Share of {safe_role} predictions: {(_top_share(base_pred, safe_role)*100):.2f}%")
+    lines.append(f"- True-role composition among predictions labeled {safe_role}:")
     for r in ROLE_ORDER:
         lines.append(f"  - {r}: {base_true_break.get(r, 0)}")
     lines.append("- Interpretation:")
@@ -827,7 +963,7 @@ def write_report(
     lines.append("## 2) Focus-technique behavior")
     for focus_label, focus_examples in focus_sections:
         focus_pred = Counter(ex.pred_role for ex in focus_examples if ex.pred_role)
-        focus_top_role = max(focus_pred.items(), key=lambda x: x[1])[0] if focus_pred else "assassin"
+        focus_top_role = max(focus_pred.items(), key=lambda x: x[1])[0] if focus_pred else focus_role
         focus_true_break = _true_role_breakdown_for_pred(focus_examples, focus_top_role)
         focus_decisions = _extract_decision_stats(focus_examples)
 
@@ -857,12 +993,12 @@ def write_report(
         lines.append("")
         lines.append("## 4) Hypothesis tests and uncertainty")
         bs = hypothesis_tests.get("baseline_vs_belief_social", {}) or {}
-        s1 = bs.get("servant_1_share", {}) or {}
-        ass = bs.get("assassin_share", {}) or {}
+        s1 = bs.get("safe_role_share", {}) or {}
+        ass = bs.get("focus_role_share", {}) or {}
         dist = bs.get("distribution_shift_test", {}) or {}
         lines.append("### baseline vs belief+social")
         lines.append(
-            "- servant-1 share: "
+            f"- {safe_role} share: "
             f"baseline={float(s1.get('baseline_share', 0.0)):.4f} "
             f"(95% CI [{float(s1.get('baseline_ci_low', 0.0)):.4f}, {float(s1.get('baseline_ci_high', 0.0)):.4f}]), "
             f"belief+social={float(s1.get('target_share', 0.0)):.4f} "
@@ -870,7 +1006,7 @@ def write_report(
             f"delta={float(s1.get('delta', 0.0)):.4f}, permutation p={float(s1.get('perm_p_value', 1.0)):.6f}"
         )
         lines.append(
-            "- assassin share: "
+            f"- {focus_role} share: "
             f"baseline={float(ass.get('baseline_share', 0.0)):.4f} "
             f"(95% CI [{float(ass.get('baseline_ci_low', 0.0)):.4f}, {float(ass.get('baseline_ci_high', 0.0)):.4f}]), "
             f"belief+social={float(ass.get('target_share', 0.0)):.4f} "
@@ -878,7 +1014,7 @@ def write_report(
             f"delta={float(ass.get('delta', 0.0)):.4f}, permutation p={float(ass.get('perm_p_value', 1.0)):.6f}"
         )
         lines.append(
-            "- full predicted-role distribution shift (2x6): "
+            f"- full predicted-role distribution shift (2x{len(ROLE_ORDER)}): "
             f"chi-square={float(dist.get('chi_square', 0.0)):.4f}, dof={int(dist.get('dof', 0))}, "
             f"permutation p={float(dist.get('p_value', 1.0)):.6f}, Cramer's V={float(dist.get('cramers_v', 0.0)):.4f}"
         )
@@ -899,13 +1035,14 @@ def _plot_condition_bundle(
     cond_examples: List[Example],
     cond_runs: List[List[Example]],
     outdir: Path,
+    focus_role: str,
 ) -> None:
     if not cond_runs:
         print(f"[warn] Skipping '{cond_label}' because no runs were loaded.")
         return
 
-    true_arr = np.array([role_count_vector(run, source="true") for run in cond_runs], dtype=float)
-    pred_arr = np.array([role_count_vector(run, source="pred") for run in cond_runs], dtype=float)
+    true_arr = np.array([role_share_vector(run, source="true") for run in cond_runs], dtype=float)
+    pred_arr = np.array([role_share_vector(run, source="pred") for run in cond_runs], dtype=float)
     true_mean, true_std = _safe_mean_std(true_arr, len(ROLE_ORDER))
     pred_mean, pred_std = _safe_mean_std(pred_arr, len(ROLE_ORDER))
 
@@ -925,12 +1062,13 @@ def _plot_condition_bundle(
         f"{cond_label} Confusion Matrix (Row-normalized)",
     )
 
-    assassin_bucket_arr = np.array([assassin_bucket_vector(run) for run in cond_runs], dtype=float)
-    ass_mean, ass_std = _safe_mean_std(assassin_bucket_arr, 4)
-    plot_assassin_diagnostics(
+    focus_bucket_arr = np.array([role_bucket_share_vector(run, focus_role) for run in cond_runs], dtype=float)
+    ass_mean, ass_std = _safe_mean_std(focus_bucket_arr, 4)
+    plot_role_diagnostics(
         ass_mean,
         ass_std,
-        outdir / f"{cond_slug}_assassin_by_quest_bucket.pdf",
+        outdir / f"{cond_slug}_{_slugify(focus_role)}_by_quest_bucket.pdf",
+        role_name=focus_role,
     )
 
 
@@ -978,6 +1116,12 @@ def main() -> None:
         default=Path("outputs/analysis/explainability"),
         help="Directory where report and PDF plots are saved.",
     )
+    parser.add_argument("--role_order", type=str, default=None, help="Optional comma-separated role order for plots/matrices.")
+    parser.add_argument("--evil_roles", type=str, default=None, help="Optional comma-separated evil roles.")
+    parser.add_argument("--good_roles", type=str, default=None, help="Optional comma-separated good roles.")
+    parser.add_argument("--merlin_role", type=str, default="merlin", help="Role name treated as merlin class for grouped metrics.")
+    parser.add_argument("--safe_role", type=str, default=None, help="Optional baseline focus role in report/hypothesis (e.g., servant or servant-1).")
+    parser.add_argument("--focus_role", type=str, default=None, help="Optional role used for quest-bucket diagnostics (e.g., assassin).")
     args = parser.parse_args()
 
     _configure_plot_style()
@@ -1014,12 +1158,27 @@ def main() -> None:
     if not bundles:
         raise SystemExit("No non-empty condition bundles found.")
 
+    role_cfg = _resolve_role_config(
+        bundles=bundles,
+        role_order_arg=args.role_order,
+        evil_roles_arg=args.evil_roles,
+        good_roles_arg=args.good_roles,
+        merlin_role_arg=args.merlin_role,
+        safe_role_arg=args.safe_role,
+        focus_role_arg=args.focus_role,
+    )
+    print(
+        f"[info] Role config: roles={role_cfg['role_order']} | evil={role_cfg['evil_roles']} | "
+        f"good={role_cfg['good_roles']} | merlin={role_cfg['merlin_role']} | "
+        f"safe_role={role_cfg['safe_role']} | focus_role={role_cfg['focus_role']}"
+    )
+
     baseline_bundle = _latest_by_technique(bundles, "baseline_full_transcript")
     belief_social_bundle = _latest_by_technique(bundles, "belief_vector+social")
 
     if baseline_bundle is not None:
-        base_true_arr = np.array([role_count_vector(run, source="true") for run in baseline_bundle.runs], dtype=float)
-        base_pred_arr = np.array([role_count_vector(run, source="pred") for run in baseline_bundle.runs], dtype=float)
+        base_true_arr = np.array([role_share_vector(run, source="true") for run in baseline_bundle.runs], dtype=float)
+        base_pred_arr = np.array([role_share_vector(run, source="pred") for run in baseline_bundle.runs], dtype=float)
         base_true_mean, base_true_std = _safe_mean_std(base_true_arr, len(ROLE_ORDER))
         base_pred_mean, base_pred_std = _safe_mean_std(base_pred_arr, len(ROLE_ORDER))
         plot_distribution_comparison(
@@ -1040,7 +1199,7 @@ def main() -> None:
     for b in bundles:
         if b.technique == "baseline_full_transcript":
             continue
-        _plot_condition_bundle(b.label, b.slug, b.examples, b.runs, args.outdir)
+        _plot_condition_bundle(b.label, b.slug, b.examples, b.runs, args.outdir, focus_role=str(role_cfg["focus_role"]))
 
     conditions: List[Tuple[str, List[Example], List[List[Example]]]] = [(b.label, b.examples, b.runs) for b in bundles]
     three_class = {name: three_class_metrics(exs) for name, exs, _ in conditions}
@@ -1066,22 +1225,24 @@ def main() -> None:
 
     hypothesis_tests: Dict[str, Any] = {}
     if baseline_bundle is not None and belief_social_bundle is not None:
-        s1_base_ci = bootstrap_role_share_ci(baseline_bundle.runs, role="servant-1", n_boot=3000, seed=101)
-        s1_bs_ci = bootstrap_role_share_ci(belief_social_bundle.runs, role="servant-1", n_boot=3000, seed=102)
-        ass_base_ci = bootstrap_role_share_ci(baseline_bundle.runs, role="assassin", n_boot=3000, seed=103)
-        ass_bs_ci = bootstrap_role_share_ci(belief_social_bundle.runs, role="assassin", n_boot=3000, seed=104)
+        safe_role = str(role_cfg["safe_role"])
+        focus_role = str(role_cfg["focus_role"])
+        s1_base_ci = bootstrap_role_share_ci(baseline_bundle.runs, role=safe_role, n_boot=3000, seed=101)
+        s1_bs_ci = bootstrap_role_share_ci(belief_social_bundle.runs, role=safe_role, n_boot=3000, seed=102)
+        ass_base_ci = bootstrap_role_share_ci(baseline_bundle.runs, role=focus_role, n_boot=3000, seed=103)
+        ass_bs_ci = bootstrap_role_share_ci(belief_social_bundle.runs, role=focus_role, n_boot=3000, seed=104)
 
         s1_perm = permutation_test_single_role_share_shift(
             baseline_bundle.examples,
             belief_social_bundle.examples,
-            role="servant-1",
+            role=safe_role,
             n_perm=10000,
             seed=201,
         )
         ass_perm = permutation_test_single_role_share_shift(
             baseline_bundle.examples,
             belief_social_bundle.examples,
-            role="assassin",
+            role=focus_role,
             n_perm=10000,
             seed=202,
         )
@@ -1097,21 +1258,23 @@ def main() -> None:
 
         hypothesis_tests = {
             "baseline_vs_belief_social": {
-                "servant_1_share": {
-                    "baseline_share": float(baseline_pred_share[ROLE_ORDER.index("servant-1")]),
+                "safe_role": safe_role,
+                "focus_role": focus_role,
+                "safe_role_share": {
+                    "baseline_share": float(baseline_pred_share[ROLE_ORDER.index(safe_role)]),
                     "baseline_ci_low": float(s1_base_ci["ci_low"]),
                     "baseline_ci_high": float(s1_base_ci["ci_high"]),
-                    "target_share": float(belief_social_pred_share[ROLE_ORDER.index("servant-1")]),
+                    "target_share": float(belief_social_pred_share[ROLE_ORDER.index(safe_role)]),
                     "target_ci_low": float(s1_bs_ci["ci_low"]),
                     "target_ci_high": float(s1_bs_ci["ci_high"]),
                     "delta": float(s1_perm["delta"]),
                     "perm_p_value": float(s1_perm["p_value"]),
                 },
-                "assassin_share": {
-                    "baseline_share": float(baseline_pred_share[ROLE_ORDER.index("assassin")]),
+                "focus_role_share": {
+                    "baseline_share": float(baseline_pred_share[ROLE_ORDER.index(focus_role)]),
                     "baseline_ci_low": float(ass_base_ci["ci_low"]),
                     "baseline_ci_high": float(ass_base_ci["ci_high"]),
-                    "target_share": float(belief_social_pred_share[ROLE_ORDER.index("assassin")]),
+                    "target_share": float(belief_social_pred_share[ROLE_ORDER.index(focus_role)]),
                     "target_ci_low": float(ass_bs_ci["ci_low"]),
                     "target_ci_high": float(ass_bs_ci["ci_high"]),
                     "delta": float(ass_perm["delta"]),
@@ -1130,6 +1293,8 @@ def main() -> None:
         baseline_bundle.examples if baseline_bundle is not None else [],
         [(b.label, b.examples) for b in bundles if b.technique != "baseline_full_transcript"],
         three_class,
+        safe_role=str(role_cfg["safe_role"]),
+        focus_role=str(role_cfg["focus_role"]),
         hypothesis_tests=hypothesis_tests or None,
     )
 
@@ -1137,6 +1302,7 @@ def main() -> None:
         "baseline_n": len(baseline_bundle.examples) if baseline_bundle is not None else 0,
         "belief_social_n": len(belief_social_bundle.examples) if belief_social_bundle is not None else 0,
         "three_class_metrics": three_class,
+        "role_config": role_cfg,
         "hypothesis_tests": hypothesis_tests,
         "output_dir": str(args.outdir),
         "bundles": [
