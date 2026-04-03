@@ -120,6 +120,46 @@ PROMPT_REGISTRY: Dict[str, PromptStrategy] = {}
 LLM_POST_REGISTRY: Dict[str, LLMPostProcessor] = {}
 
 
+def _canonicalize_role_label(role: str | None, one_servant: bool) -> str | None:
+    if role is None:
+        return None
+    role_s = str(role).strip()
+    if not role_s:
+        return None
+    if one_servant and role_s.lower() in {"servant-1", "servant-2", "servant"}:
+        return "servant"
+    return role_s
+
+
+def _canonicalize_roles_list(valid_roles: List[str], one_servant: bool) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for role in valid_roles:
+        mapped = _canonicalize_role_label(role, one_servant)
+        if not mapped:
+            continue
+        key = mapped.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(mapped)
+    return sorted(out, key=lambda x: x.lower())
+
+
+def _sanitize_avalon_mentions(prompt: str, no_avalon_mentioned: bool) -> str:
+    if not no_avalon_mentioned:
+        return prompt
+    if not isinstance(prompt, str) or not prompt:
+        return prompt
+
+    text = prompt
+    text = text.replace("an Avalon game round", "a strategic multi-party dialog round")
+    text = text.replace("an Avalon game", "a strategic multi-party dialog")
+    text = text.replace("Avalon game", "strategic multi-party dialog")
+    text = text.replace("Avalon", "strategic dialog")
+    return text
+
+
 def register_prompt(name: str) -> Callable[[PromptStrategy], PromptStrategy]:
     def _wrap(fn: PromptStrategy) -> PromptStrategy:
         PROMPT_REGISTRY[name] = fn
@@ -766,6 +806,8 @@ def evaluate_config(
     llm_fixer: str = "none",
     save_llm_io: bool = False,
     llm_io_max_chars: int = 0,
+    no_avalon_mentioned: bool = False,
+    one_servant: bool = False,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
     """
@@ -795,7 +837,8 @@ def evaluate_config(
     print(f"    [progress] Built {len(all_entries)} entries (memory_format='{memory_format}') in {build_elapsed:.2f}s")
 
     # Enumerate valid roles from dataset once (for parsing LLM output consistently)
-    valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
+    raw_valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
+    valid_roles: List[str] = _canonicalize_roles_list(raw_valid_roles, one_servant=one_servant)
 
     results: List[Dict[str, Any]] = []
     # Classification counters for proposer-role prediction
@@ -868,6 +911,8 @@ def evaluate_config(
             "valid_roles": valid_roles,
             "vector_state_by_game": vector_state_by_game,
             "rolling_notes_by_game": rolling_notes_by_game,
+            "one_servant": bool(one_servant),
+            "no_avalon_mentioned": bool(no_avalon_mentioned),
         }
 
         prompt_fn = PROMPT_REGISTRY.get(prompt_name)
@@ -875,6 +920,7 @@ def evaluate_config(
             raise ValueError(f"Unknown prompt strategy: {prompt_name}")
 
         llm_prompt_text, prompt_meta = prompt_fn(target, retrieved_pairs, ctx)
+        llm_prompt_text = _sanitize_avalon_mentions(llm_prompt_text, no_avalon_mentioned=bool(no_avalon_mentioned))
 
         # Explicit, machine-friendly heuristic provenance for downstream analysis.
         retrieved_with_summary_count = sum(
@@ -900,6 +946,8 @@ def evaluate_config(
                 if str(strategy_mode) == "llm_self_note"
                 else '{"role": "<ROLE>"}'
             ),
+            "no_avalon_mentioned": bool(no_avalon_mentioned),
+            "one_servant": bool(one_servant),
         }
 
         # For backwards-compatible stats, treat this single prompt as both baseline and with-memory.
@@ -962,7 +1010,7 @@ def evaluate_config(
             )
 
         # Proposer-role prediction (LLM or heuristic fallback)
-        true_role = target.proposer_role
+        true_role = _canonicalize_role_label(target.proposer_role, one_servant=one_servant)
         pred_role = None
         processed_used_repair: bool = False
         processed_beliefs_preview: str | None = None
@@ -989,6 +1037,7 @@ def evaluate_config(
                 },
             )
             pred_role = post_out.get("pred_role")
+            pred_role = _canonicalize_role_label(pred_role, one_servant=one_servant)
             processed_used_repair = bool(post_out.get("used_repair"))
             if processed_used_repair:
                 fixer_used_repair += 1
@@ -1014,7 +1063,7 @@ def evaluate_config(
             if len(sequential_memory_idx) > 0:
                 cand_role = all_entries[int(sequential_memory_idx[-1])].proposer_role
                 if cand_role is not None:
-                    pred_role = cand_role
+                    pred_role = _canonicalize_role_label(cand_role, one_servant=one_servant)
         if true_role is not None:
             roles_seen.add(true_role)
         if pred_role is not None:
@@ -1188,6 +1237,8 @@ def evaluate_config(
         "template_summary_enabled": memory_format == "template+summary",
         "vector_memory_enabled": str(prompt_name).startswith("vector_memory"),
         "social_cues_enabled": ("social" in str(prompt_name)),
+        "no_avalon_mentioned": bool(no_avalon_mentioned),
+        "one_servant": bool(one_servant),
         "avg_retrieved_with_heuristic_summary": (
             float(np.mean([r.get("heuristics", {}).get("retrieved_with_heuristic_summary_count", 0) for r in results]))
             if results
@@ -1289,6 +1340,8 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--llm_fixer_baseline", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional baseline-only LLM fixer (overrides --llm_fixer for baseline).")
     ap.add_argument("--llm_fixer_current", type=str, default=None, choices=list(LLM_POST_REGISTRY.keys()), help="Optional current-only LLM fixer (overrides --llm_fixer for current).")
     ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary", "baseline_vs_self_note"], help="Named experiment preset. 'custom' uses provided arguments.")
+    ap.add_argument("--no-avalon-mentioned", action="store_true", help="Remove explicit Avalon mentions from generated prompts while keeping role labels unchanged.")
+    ap.add_argument("--one-servant", action="store_true", help="Merge servant-1 and servant-2 into a single canonical role 'servant'.")
 
     # LLM logging / reproducibility
     ap.add_argument("--save_llm_io", action="store_true", help="Save full LLM prompts/responses (including repair calls) into results JSON (large files)")
@@ -1385,6 +1438,8 @@ def main(argv: List[str] | None = None) -> int:
                 llm_fixer=(args.llm_fixer_baseline or args.llm_fixer),
                 save_llm_io=save_llm_io,
                 llm_io_max_chars=int(args.llm_io_max_chars),
+                no_avalon_mentioned=bool(args.no_avalon_mentioned),
+                one_servant=bool(args.one_servant),
             )
             agg_base_runs.append(agg_base_i)
             with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -1406,6 +1461,8 @@ def main(argv: List[str] | None = None) -> int:
                 llm_fixer=(args.llm_fixer_current or args.llm_fixer),
                 save_llm_io=save_llm_io,
                 llm_io_max_chars=int(args.llm_io_max_chars),
+                no_avalon_mentioned=bool(args.no_avalon_mentioned),
+                one_servant=bool(args.one_servant),
             )
             agg_cur_runs.append(agg_cur_i)
             with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:

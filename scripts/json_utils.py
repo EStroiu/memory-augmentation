@@ -180,9 +180,13 @@ def extract_role_label(text: str | None, valid_roles: List[str]) -> str | None:
     1) Parse JSON {"role": "<ROLE>"} and validate against valid_roles.
     2) Fallback: contains/word-boundary matching.
     """
+    has_single_servant = any(str(v).strip().lower() == "servant" for v in valid_roles)
+
     role = parse_json_role(text)
     if role and valid_roles:
         role_key = role.strip().lower()
+        if has_single_servant and role_key in {"servant", "servant-1", "servant-2"}:
+            return "servant"
         for vr in valid_roles:
             if role_key == vr.lower():
                 return vr
@@ -192,6 +196,10 @@ def extract_role_label(text: str | None, valid_roles: List[str]) -> str | None:
 
     t = text.strip()
     tl = t.lower()
+
+    if has_single_servant:
+        if re.search(r"\bservant(?:-1|-2)?\b", tl, flags=re.IGNORECASE):
+            return "servant"
 
     # 1) Exact match against a canonical role label.
     for vr in valid_roles:
