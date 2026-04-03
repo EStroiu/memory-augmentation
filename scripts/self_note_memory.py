@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from scripts.template_summary import MemoryEntry, quest_state_line
+from scripts.template_summary import MemoryEntry
 from scripts.json_utils import extract_object_from_brace, extract_role_label, typechat_repair_to_json
 
 
@@ -76,34 +76,29 @@ def build_llm_self_note_prompt(
     valid_roles: List[str] = ctx["valid_roles"]
     role_list = ", ".join(valid_roles) if valid_roles else "unknown"
 
-    rolling_note_by_game: Dict[str, str] = ctx.setdefault("rolling_note_by_game", {})
-    prev_note = str(rolling_note_by_game.get(game_id, "")).strip()
-    if not prev_note:
-        prev_note = "(none yet)"
+    rolling_notes_by_game: Dict[str, List[str]] = ctx.setdefault("rolling_notes_by_game", {})
+    prev_notes = rolling_notes_by_game.get(game_id, [])
+    if not isinstance(prev_notes, list):
+        prev_notes = [str(prev_notes)] if str(prev_notes).strip() else []
 
-    past_state_lines: List[str] = []
-    for q in sorted(quests.keys()):
-        if int(q) >= int(target.quest):
-            continue
-        past_state_lines.append(quest_state_line(game_id, int(q), quests[q]))
-
-    context_block = "\n".join(past_state_lines[-4:]) if past_state_lines else "(no completed quests yet)"
+    notes_lines: List[str] = []
+    for i, note in enumerate(prev_notes, start=1):
+        txt = str(note).strip()
+        if txt:
+            notes_lines.append(f"[{i}] {txt}")
+    notes_block = "\n".join(notes_lines) if notes_lines else "(none yet)"
 
     lines: List[str] = []
-    lines.append("System: You are an Avalon role analyst maintaining a compact running memory.")
+    lines.append("System: You are helping analyze an Avalon game round. No external memory is provided for this baseline.")
     lines.append("")
     lines.append(f"Game: {game_id} | Quest: {int(target.quest)}")
-    if players:
-        lines.append("Players: " + ", ".join(players))
+    lines.append(f"Target: GAME {game_id} | QUEST {int(target.quest)}")
     lines.append("")
-    lines.append("Running memory note from previous quests:")
-    lines.append(prev_note)
-    lines.append("")
-    lines.append("Recent completed-quest state (most recent first omitted, chronological shown):")
-    lines.append(context_block)
-    lines.append("")
-    lines.append("Current quest structured context:")
+    lines.append("Target round context:")
     lines.append(target.text)
+    lines.append("")
+    lines.append("Model-authored running notes from previous quests in this game:")
+    lines.append(notes_block)
     lines.append("")
     lines.append("Task:")
     lines.append(f"1) Predict the role of the player who proposed the party. Valid roles: {role_list}.")
@@ -123,7 +118,8 @@ def build_llm_self_note_prompt(
     meta: Dict[str, Any] = {
         "mode": "llm_self_note",
         "self_note_enabled": True,
-        "self_note_prev_chars": len(prev_note) if prev_note != "(none yet)" else 0,
+        "self_note_prev_chars": len(notes_block) if notes_block != "(none yet)" else 0,
+        "self_note_prev_count": len(notes_lines),
     }
     return prompt, meta
 

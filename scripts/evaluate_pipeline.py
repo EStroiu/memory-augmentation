@@ -817,8 +817,8 @@ def evaluate_config(
     # For vector_memory prompt: per-game vector states
     vector_state_by_game: Dict[str, Any] = {}
 
-    # For llm_self_note prompt: rolling model-authored note per game
-    rolling_note_by_game: Dict[str, str] = {}
+    # For llm_self_note prompt: cumulative model-authored notes per game
+    rolling_notes_by_game: Dict[str, List[str]] = {}
 
     # LLM fixer statistics
     fixer_total_calls: int = 0
@@ -867,7 +867,7 @@ def evaluate_config(
             "belief_confidence_by_game": belief_confidence_by_game,
             "valid_roles": valid_roles,
             "vector_state_by_game": vector_state_by_game,
-            "rolling_note_by_game": rolling_note_by_game,
+            "rolling_notes_by_game": rolling_notes_by_game,
         }
 
         prompt_fn = PROMPT_REGISTRY.get(prompt_name)
@@ -1005,9 +1005,10 @@ def evaluate_config(
             if memory_note_next is None and str(heuristics_info.get("strategy_mode")) == "llm_self_note":
                 memory_note_next = _normalize_memory_note(_parse_role_note_json(raw_pred).get("memory_note"))
 
-            # Update rolling LLM-authored note for this game when provided.
+            # Append model-authored note for this game when provided.
             if memory_note_next is not None:
-                rolling_note_by_game[str(target.game_id)] = memory_note_next
+                game_key = str(target.game_id)
+                rolling_notes_by_game.setdefault(game_key, []).append(memory_note_next)
         else:
             # Fallback heuristic: transfer proposer role from most recent prior round in same game
             if len(sequential_memory_idx) > 0:
