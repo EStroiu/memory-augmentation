@@ -62,6 +62,37 @@ def normalize_memory_note(note: Optional[str], max_chars: int = 320) -> Optional
     return truncated + "..."
 
 
+def _apply_note_window(
+    notes: List[str],
+    selection: str = "newest",
+    k: Optional[int] = None,
+) -> List[str]:
+    """Select which prior notes are shown in prompt history."""
+    if not notes:
+        return []
+
+    sel = str(selection or "newest").strip().lower()
+    if sel not in {"newest", "oldest"}:
+        sel = "newest"
+
+    if k is None:
+        return list(notes)
+
+    try:
+        k_int = int(k)
+    except Exception:
+        return list(notes)
+
+    if k_int <= 0:
+        return []
+    if k_int >= len(notes):
+        return list(notes)
+
+    if sel == "oldest":
+        return list(notes[:k_int])
+    return list(notes[-k_int:])
+
+
 def build_llm_self_note_prompt(
     target: MemoryEntry,
     retrieved: List[Tuple[MemoryEntry, float]],
@@ -81,8 +112,20 @@ def build_llm_self_note_prompt(
     if not isinstance(prev_notes, list):
         prev_notes = [str(prev_notes)] if str(prev_notes).strip() else []
 
+    window_selection = str(ctx.get("self_note_selection", "newest") or "newest")
+    window_k_raw = ctx.get("self_note_k")
+    window_k: Optional[int]
+    if window_k_raw is None:
+        window_k = None
+    else:
+        try:
+            window_k = int(window_k_raw)
+        except Exception:
+            window_k = None
+    shown_notes = _apply_note_window(prev_notes, selection=window_selection, k=window_k)
+
     notes_lines: List[str] = []
-    for i, note in enumerate(prev_notes, start=1):
+    for i, note in enumerate(shown_notes, start=1):
         txt = str(note).strip()
         if txt:
             notes_lines.append(f"[{i}] {txt}")
@@ -118,6 +161,12 @@ def build_llm_self_note_prompt(
     meta: Dict[str, Any] = {
         "mode": "llm_self_note",
         "self_note_enabled": True,
+        "self_note_window_mode": window_selection,
+        "self_note_window_k": window_k,
+        "self_note_prev_total_count": len(prev_notes),
+        "self_note_prev_total_chars": sum(len(str(n)) for n in prev_notes),
+        "self_note_shown_count": len(notes_lines),
+        "self_note_shown_chars": len(notes_block) if notes_block != "(none yet)" else 0,
         "self_note_prev_chars": len(notes_block) if notes_block != "(none yet)" else 0,
         "self_note_prev_count": len(notes_lines),
     }

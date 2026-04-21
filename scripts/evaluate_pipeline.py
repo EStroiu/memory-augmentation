@@ -808,6 +808,8 @@ def evaluate_config(
     llm_io_max_chars: int = 0,
     no_avalon_mentioned: bool = False,
     one_servant: bool = False,
+    self_note_selection: str = "newest",
+    self_note_k: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Evaluate one configuration and return (aggregate, results).
     """
@@ -913,6 +915,8 @@ def evaluate_config(
             "rolling_notes_by_game": rolling_notes_by_game,
             "one_servant": bool(one_servant),
             "no_avalon_mentioned": bool(no_avalon_mentioned),
+            "self_note_selection": str(self_note_selection),
+            "self_note_k": self_note_k,
         }
 
         prompt_fn = PROMPT_REGISTRY.get(prompt_name)
@@ -940,6 +944,12 @@ def evaluate_config(
             "social_total_detected_flips": int((social_cues_meta or {}).get("total_detected_flips", 0)) if isinstance(social_cues_meta, dict) else 0,
             "vector_memory_heuristics_explained_in_prompt": "Heuristics used to compute this memory:" in llm_prompt_text,
             "self_note_enabled": str(strategy_mode) == "llm_self_note",
+            "self_note_window_mode": (prompt_meta or {}).get("self_note_window_mode") if isinstance(prompt_meta, dict) else None,
+            "self_note_window_k": (prompt_meta or {}).get("self_note_window_k") if isinstance(prompt_meta, dict) else None,
+            "self_note_prev_total_count": int((prompt_meta or {}).get("self_note_prev_total_count", 0)) if isinstance(prompt_meta, dict) else 0,
+            "self_note_prev_total_chars": int((prompt_meta or {}).get("self_note_prev_total_chars", 0)) if isinstance(prompt_meta, dict) else 0,
+            "self_note_shown_count": int((prompt_meta or {}).get("self_note_shown_count", 0)) if isinstance(prompt_meta, dict) else 0,
+            "self_note_shown_chars": int((prompt_meta or {}).get("self_note_shown_chars", 0)) if isinstance(prompt_meta, dict) else 0,
             "task_schema_enforced": True,
             "task_schema": (
                 '{"role":"<ROLE>","memory_note":"<UPDATED_NOTE>"}'
@@ -1170,6 +1180,12 @@ def evaluate_config(
                 "llm_warning": llm_out.get("warning") or llm_out.get("truncated"),
                 "llm_duration_s": llm_out.get("duration_s"),
                 "memory_note_chars": len(memory_note_next) if isinstance(memory_note_next, str) else 0,
+                "self_note_window_mode": heuristics_info.get("self_note_window_mode"),
+                "self_note_window_k": heuristics_info.get("self_note_window_k"),
+                "self_note_shown_count": heuristics_info.get("self_note_shown_count"),
+                "self_note_shown_chars": heuristics_info.get("self_note_shown_chars"),
+                "self_note_prev_total_count": heuristics_info.get("self_note_prev_total_count"),
+                "self_note_prev_total_chars": heuristics_info.get("self_note_prev_total_chars"),
                 "true_role": true_role,
                 "pred_role": pred_role,
             },
@@ -1265,6 +1281,26 @@ def evaluate_config(
             float(np.mean([r.get("heuristics", {}).get("social_total_detected_flips", 0) for r in results])) if results else 0.0
         ),
         "self_note_enabled": str(prompt_name) == "llm_self_note",
+        "self_note_window_mode": next(
+            (r.get("heuristics", {}).get("self_note_window_mode") for r in results if r.get("heuristics", {}).get("self_note_window_mode") is not None),
+            None,
+        ),
+        "self_note_window_k": next(
+            (r.get("heuristics", {}).get("self_note_window_k") for r in results if "self_note_window_k" in r.get("heuristics", {})),
+            None,
+        ),
+        "avg_self_note_shown_count": (
+            float(np.mean([r.get("heuristics", {}).get("self_note_shown_count", 0) for r in results])) if results else 0.0
+        ),
+        "avg_self_note_shown_chars": (
+            float(np.mean([r.get("heuristics", {}).get("self_note_shown_chars", 0) for r in results])) if results else 0.0
+        ),
+        "avg_self_note_prev_total_count": (
+            float(np.mean([r.get("heuristics", {}).get("self_note_prev_total_count", 0) for r in results])) if results else 0.0
+        ),
+        "avg_self_note_prev_total_chars": (
+            float(np.mean([r.get("heuristics", {}).get("self_note_prev_total_chars", 0) for r in results])) if results else 0.0
+        ),
         "avg_self_note_chars": (
             float(np.mean([r.get("log_row", {}).get("memory_note_chars", 0) for r in results])) if results else 0.0
         ),
@@ -1342,6 +1378,19 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--exp", type=str, default="custom", choices=["custom", "baseline_full", "baseline_vs_template", "baseline_vs_template+summary", "baseline_vs_self_note"], help="Named experiment preset. 'custom' uses provided arguments.")
     ap.add_argument("--no-avalon-mentioned", action="store_true", help="Remove explicit Avalon mentions from generated prompts while keeping role labels unchanged.")
     ap.add_argument("--one-servant", action="store_true", help="Merge servant-1 and servant-2 into a single canonical role 'servant'.")
+    ap.add_argument(
+        "--self_note_selection",
+        type=str,
+        default="newest",
+        choices=["newest", "oldest"],
+        help="When using llm_self_note, select which notes to show when K is set.",
+    )
+    ap.add_argument(
+        "--self_note_k",
+        type=str,
+        default="all",
+        help="When using llm_self_note, number of prior notes to include (positive int) or 'all'.",
+    )
 
     # LLM logging / reproducibility
     ap.add_argument("--save_llm_io", action="store_true", help="Save full LLM prompts/responses (including repair calls) into results JSON (large files)")
@@ -1365,6 +1414,18 @@ def main(argv: List[str] | None = None) -> int:
         # This fixer parses both role and updated running note.
         if not args.llm_fixer_current:
             args.llm_fixer_current = "typechat_role_note"
+
+    # Parse self-note window size once; keep None as "all".
+    self_note_k: Optional[int] = None
+    if str(args.self_note_k).strip().lower() != "all":
+        try:
+            self_note_k = int(str(args.self_note_k).strip())
+        except Exception:
+            print("Invalid --self_note_k value. Use a positive integer or 'all'.", file=sys.stderr)
+            return 1
+        if self_note_k <= 0:
+            print("Invalid --self_note_k value. Use a positive integer or 'all'.", file=sys.stderr)
+            return 1
 
     # Default behavior: if using LLM, save IO unless explicitly disabled.
     save_llm_io = bool(args.save_llm_io) or (bool(args.llm) and not bool(args.no_save_llm_io))
@@ -1440,6 +1501,8 @@ def main(argv: List[str] | None = None) -> int:
                 llm_io_max_chars=int(args.llm_io_max_chars),
                 no_avalon_mentioned=bool(args.no_avalon_mentioned),
                 one_servant=bool(args.one_servant),
+                self_note_selection=str(args.self_note_selection),
+                self_note_k=self_note_k,
             )
             agg_base_runs.append(agg_base_i)
             with (run_subdir / "results_baseline.json").open("w", encoding="utf-8") as f:
@@ -1463,6 +1526,8 @@ def main(argv: List[str] | None = None) -> int:
                 llm_io_max_chars=int(args.llm_io_max_chars),
                 no_avalon_mentioned=bool(args.no_avalon_mentioned),
                 one_servant=bool(args.one_servant),
+                self_note_selection=str(args.self_note_selection),
+                self_note_k=self_note_k,
             )
             agg_cur_runs.append(agg_cur_i)
             with (run_subdir / "results_current.json").open("w", encoding="utf-8") as f:
