@@ -94,6 +94,7 @@ class ExperimentConfig:
 
     # Human-readable name for output folder naming
     experiment_name: str = "custom"
+    grouped_role_task: bool = False
 
 
 class PromptStrategy(Protocol):
@@ -120,22 +121,34 @@ PROMPT_REGISTRY: Dict[str, PromptStrategy] = {}
 LLM_POST_REGISTRY: Dict[str, LLMPostProcessor] = {}
 
 
-def _canonicalize_role_label(role: str | None, one_servant: bool) -> str | None:
+def _canonicalize_role_label(role: str | None, one_servant: bool, grouped_role_task: bool = False) -> str | None:
     if role is None:
         return None
     role_s = str(role).strip()
     if not role_s:
         return None
-    if one_servant and role_s.lower() in {"servant-1", "servant-2", "servant"}:
-        return "servant"
+    key = role_s.lower()
+    if one_servant and key in {"servant-1", "servant-2", "servant"}:
+        role_s = "servant"
+        key = "servant"
+    if grouped_role_task:
+        if key in {"good", "evil", "merlin"}:
+            return key
+        if key in {"assassin", "morgana"}:
+            return "evil"
+        if key == "merlin":
+            return "merlin"
+        if key in {"servant-1", "servant-2", "servant", "percival"}:
+            return "good"
+        return None
     return role_s
 
 
-def _canonicalize_roles_list(valid_roles: List[str], one_servant: bool) -> List[str]:
+def _canonicalize_roles_list(valid_roles: List[str], one_servant: bool, grouped_role_task: bool = False) -> List[str]:
     out: List[str] = []
     seen: set[str] = set()
     for role in valid_roles:
-        mapped = _canonicalize_role_label(role, one_servant)
+        mapped = _canonicalize_role_label(role, one_servant, grouped_role_task=grouped_role_task)
         if not mapped:
             continue
         key = mapped.lower()
@@ -808,6 +821,7 @@ def evaluate_config(
     llm_io_max_chars: int = 0,
     no_avalon_mentioned: bool = False,
     one_servant: bool = False,
+    grouped_role_task: bool = False,
     self_note_selection: str = "newest",
     self_note_k: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -840,7 +854,11 @@ def evaluate_config(
 
     # Enumerate valid roles from dataset once (for parsing LLM output consistently)
     raw_valid_roles: List[str] = sorted({e.proposer_role for e in all_entries if e.proposer_role})  # type: ignore[arg-type]
-    valid_roles: List[str] = _canonicalize_roles_list(raw_valid_roles, one_servant=one_servant)
+    valid_roles: List[str] = _canonicalize_roles_list(
+        raw_valid_roles,
+        one_servant=one_servant,
+        grouped_role_task=grouped_role_task,
+    )
 
     results: List[Dict[str, Any]] = []
     # Classification counters for proposer-role prediction
@@ -914,6 +932,7 @@ def evaluate_config(
             "vector_state_by_game": vector_state_by_game,
             "rolling_notes_by_game": rolling_notes_by_game,
             "one_servant": bool(one_servant),
+            "grouped_role_task": bool(grouped_role_task),
             "no_avalon_mentioned": bool(no_avalon_mentioned),
             "self_note_selection": str(self_note_selection),
             "self_note_k": self_note_k,
@@ -958,6 +977,7 @@ def evaluate_config(
             ),
             "no_avalon_mentioned": bool(no_avalon_mentioned),
             "one_servant": bool(one_servant),
+            "grouped_role_task": bool(grouped_role_task),
         }
 
         # For backwards-compatible stats, treat this single prompt as both baseline and with-memory.
@@ -1020,7 +1040,11 @@ def evaluate_config(
             )
 
         # Proposer-role prediction (LLM or heuristic fallback)
-        true_role = _canonicalize_role_label(target.proposer_role, one_servant=one_servant)
+        true_role = _canonicalize_role_label(
+            target.proposer_role,
+            one_servant=one_servant,
+            grouped_role_task=grouped_role_task,
+        )
         pred_role = None
         processed_used_repair: bool = False
         processed_beliefs_preview: str | None = None
@@ -1047,7 +1071,11 @@ def evaluate_config(
                 },
             )
             pred_role = post_out.get("pred_role")
-            pred_role = _canonicalize_role_label(pred_role, one_servant=one_servant)
+            pred_role = _canonicalize_role_label(
+                pred_role,
+                one_servant=one_servant,
+                grouped_role_task=grouped_role_task,
+            )
             processed_used_repair = bool(post_out.get("used_repair"))
             if processed_used_repair:
                 fixer_used_repair += 1
@@ -1073,7 +1101,11 @@ def evaluate_config(
             if len(sequential_memory_idx) > 0:
                 cand_role = all_entries[int(sequential_memory_idx[-1])].proposer_role
                 if cand_role is not None:
-                    pred_role = _canonicalize_role_label(cand_role, one_servant=one_servant)
+                    pred_role = _canonicalize_role_label(
+                        cand_role,
+                        one_servant=one_servant,
+                        grouped_role_task=grouped_role_task,
+                    )
         if true_role is not None:
             roles_seen.add(true_role)
         if pred_role is not None:
@@ -1255,6 +1287,7 @@ def evaluate_config(
         "social_cues_enabled": ("social" in str(prompt_name)),
         "no_avalon_mentioned": bool(no_avalon_mentioned),
         "one_servant": bool(one_servant),
+        "grouped_role_task": bool(grouped_role_task),
         "avg_retrieved_with_heuristic_summary": (
             float(np.mean([r.get("heuristics", {}).get("retrieved_with_heuristic_summary_count", 0) for r in results]))
             if results
@@ -1379,6 +1412,11 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--no-avalon-mentioned", action="store_true", help="Remove explicit Avalon mentions from generated prompts while keeping role labels unchanged.")
     ap.add_argument("--one-servant", action="store_true", help="Merge servant-1 and servant-2 into a single canonical role 'servant'.")
     ap.add_argument(
+        "--grouped-role-task",
+        action="store_true",
+        help="Predict grouped proposer role labels only: good, evil, or merlin.",
+    )
+    ap.add_argument(
         "--self_note_selection",
         type=str,
         default="newest",
@@ -1501,6 +1539,7 @@ def main(argv: List[str] | None = None) -> int:
                 llm_io_max_chars=int(args.llm_io_max_chars),
                 no_avalon_mentioned=bool(args.no_avalon_mentioned),
                 one_servant=bool(args.one_servant),
+                grouped_role_task=bool(args.grouped_role_task),
                 self_note_selection=str(args.self_note_selection),
                 self_note_k=self_note_k,
             )
@@ -1526,6 +1565,7 @@ def main(argv: List[str] | None = None) -> int:
                 llm_io_max_chars=int(args.llm_io_max_chars),
                 no_avalon_mentioned=bool(args.no_avalon_mentioned),
                 one_servant=bool(args.one_servant),
+                grouped_role_task=bool(args.grouped_role_task),
                 self_note_selection=str(args.self_note_selection),
                 self_note_k=self_note_k,
             )

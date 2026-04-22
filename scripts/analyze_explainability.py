@@ -120,6 +120,7 @@ def _resolve_role_config(
     focus_role_arg: str | None,
 ) -> Dict[str, Any]:
     inferred_roles = _infer_roles_from_bundles(bundles)
+    grouped_triplet = {"good", "evil", "merlin"}
 
     role_order_cli = _parse_csv_items(role_order_arg)
     if role_order_cli:
@@ -132,6 +133,8 @@ def _resolve_role_config(
     evil_roles_cli = set(_parse_csv_items(evil_roles_arg))
     if evil_roles_cli:
         evil_roles = {r for r in evil_roles_cli if r in role_order}
+    elif grouped_triplet.issubset(set(role_order)):
+        evil_roles = {"evil"}
     else:
         evil_roles = {r for r in EVIL_ROLES if r in role_order}
 
@@ -142,6 +145,8 @@ def _resolve_role_config(
     good_roles_cli = set(_parse_csv_items(good_roles_arg))
     if good_roles_cli:
         good_roles = {r for r in good_roles_cli if r in role_order}
+    elif grouped_triplet.issubset(set(role_order)):
+        good_roles = {"good"}
     else:
         good_roles = {r for r in role_order if r not in evil_roles and r != merlin_role}
 
@@ -584,6 +589,8 @@ def per_class_f1(true_labels: List[str], pred_labels: List[str], labels: List[st
 def role_to_three_class(role: str | None) -> str | None:
     if role is None:
         return None
+    if role in {"good", "evil", "merlin"}:
+        return role
     if MERLIN_ROLE and role == MERLIN_ROLE:
         return "merlin"
     if role in EVIL_ROLES:

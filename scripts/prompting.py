@@ -6,10 +6,17 @@ from scripts.belief_vector import build_belief_vector_prompt
 
 # ---------- Basic prompt assembly ----------
 
-def assemble_prompt(target: MemoryEntry, retrieved: List[Tuple[MemoryEntry, float]]) -> str:
+def assemble_prompt(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    task_instruction: str = "",
+) -> str:
     parts: List[str] = []
     parts.append("System: You are helping analyze an Avalon game round. Use the memory context to inform your reasoning.")
     parts.append("")
+    if task_instruction:
+        parts.append(task_instruction.strip())
+        parts.append("")
     parts.append(f"Target: GAME {target.game_id} | QUEST {target.quest}")
     parts.append("")
     parts.append("Memory context (past rounds from this game):")
@@ -17,22 +24,20 @@ def assemble_prompt(target: MemoryEntry, retrieved: List[Tuple[MemoryEntry, floa
         parts.append(f"---- Memory {i} | {entry.entry_id}")
         parts.append(entry.text)
         parts.append("")
-    parts.append("Your task: Provide an analysis or next-step reasoning for the target round using the context above.")
-    parts.append("Answer:")
     return "\n".join(parts)
 
 
-def assemble_baseline_prompt(target: MemoryEntry) -> str:
+def assemble_baseline_prompt(target: MemoryEntry, task_instruction: str = "") -> str:
     parts: List[str] = []
     parts.append("System: You are helping analyze an Avalon game round. No external memory is provided for this baseline.")
     parts.append("")
+    if task_instruction:
+        parts.append(task_instruction.strip())
+        parts.append("")
     parts.append(f"Target: GAME {target.game_id} | QUEST {target.quest}")
     parts.append("")
     parts.append("Target round context:")
     parts.append(target.text)
-    parts.append("")
-    parts.append("Your task: Provide an analysis or next-step reasoning for the target round.")
-    parts.append("Answer:")
     return "\n".join(parts)
 
 
@@ -76,7 +81,7 @@ def assemble_prompt_with_meta(
 
     The name reflects that we no longer enforce any explicit token budget.
     """
-    base = assemble_prompt(target, retrieved) + task_suffix
+    base = assemble_prompt(target, retrieved, task_instruction=task_suffix)
     meta: Dict[str, Any] = {
         "used_memory": len(retrieved),
         "total_memory_available": len(retrieved),
@@ -89,6 +94,6 @@ def assemble_baseline_prompt_with_meta(
     task_suffix: str,
 ) -> Tuple[str, Dict[str, Any]]:
     """Assemble full baseline prompt and attach simple metadata."""
-    base = assemble_baseline_prompt(target) + task_suffix
+    base = assemble_baseline_prompt(target, task_instruction=task_suffix)
     meta: Dict[str, Any] = {}
     return base, meta
