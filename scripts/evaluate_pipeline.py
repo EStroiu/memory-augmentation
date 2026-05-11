@@ -61,6 +61,7 @@ from scripts.self_note_memory import (
     parse_role_note_json as _parse_role_note_json,
     normalize_memory_note as _normalize_memory_note,
     build_llm_self_note_prompt,
+    build_llm_self_note_evil_focused_prompt,
     postprocess_typechat_role_note,
 )
 
@@ -546,6 +547,23 @@ def prompt_llm_self_note(
     ctx: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any]]:
     return build_llm_self_note_prompt(target, retrieved, ctx)
+
+
+@register_prompt("llm_self_note_evil_focused")
+def prompt_llm_self_note_evil_focused(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Evil-indicator-focused self-note variant.
+    
+    Explicitly guides the model to track behavioral signals that indicate evil roles:
+    - Defensive/accusatory stances
+    - Counter-intuitive team compositions
+    - Behavioral inconsistencies
+    - Trust/distrust patterns
+    """
+    return build_llm_self_note_evil_focused_prompt(target, retrieved, ctx)
 
 
 @register_llm_post("none")
