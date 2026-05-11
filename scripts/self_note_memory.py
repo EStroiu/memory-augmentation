@@ -173,6 +173,105 @@ def build_llm_self_note_prompt(
     return prompt, meta
 
 
+def build_llm_self_note_evil_focused_prompt(
+    target: MemoryEntry,
+    retrieved: List[Tuple[MemoryEntry, float]],
+    ctx: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Build self-note prompt focused on EVIL behavioral indicators.
+    
+    This variant explicitly guides the model to track:
+    - Behavioral inconsistencies
+    - Defensive/accusatory stances
+    - Counter-intuitive team compositions
+    - Trust/distrust patterns
+    
+    These signals are more predictive of evil roles than neutral summaries.
+    """
+    del retrieved  # Not needed; kept for strategy interface parity.
+
+    game_id: str = target.game_id
+    quests: Dict[int, List[Dict]] = ctx["game_quests"].get(game_id, {})
+    players: List[str] = ctx["game_players"].get(game_id, [])
+    valid_roles: List[str] = ctx["valid_roles"]
+    role_list = ", ".join(valid_roles) if valid_roles else "unknown"
+
+    rolling_notes_by_game: Dict[str, List[str]] = ctx.setdefault("rolling_notes_by_game", {})
+    prev_notes = rolling_notes_by_game.get(game_id, [])
+    if not isinstance(prev_notes, list):
+        prev_notes = [str(prev_notes)] if str(prev_notes).strip() else []
+
+    window_selection = str(ctx.get("self_note_selection", "newest") or "newest")
+    window_k_raw = ctx.get("self_note_k")
+    window_k: Optional[int]
+    if window_k_raw is None:
+        window_k = None
+    else:
+        try:
+            window_k = int(window_k_raw)
+        except Exception:
+            window_k = None
+    shown_notes = _apply_note_window(prev_notes, selection=window_selection, k=window_k)
+
+    notes_lines: List[str] = []
+    for i, note in enumerate(shown_notes, start=1):
+        txt = str(note).strip()
+        if txt:
+            notes_lines.append(f"[{i}] {txt}")
+    notes_block = "\n".join(notes_lines) if notes_lines else "(none yet)"
+
+    lines: List[str] = []
+    lines.append("System: You are analyzing an Avalon game to identify player roles.")
+    lines.append("")
+    lines.append(f"Game: {game_id} | Quest: {int(target.quest)}")
+    lines.append("")
+    lines.append("Target round context:")
+    lines.append(target.text)
+    lines.append("")
+    lines.append("Your running observations from previous quests (focus on role signals):")
+    lines.append(notes_block)
+    lines.append("")
+    lines.append("Task:")
+    lines.append(f"1) Predict the role of the player who proposed the party. Valid roles: {role_list}.")
+    lines.append("2) Write an updated DIAGNOSTIC NOTE for future prediction (focus on role indicators).")
+    lines.append("")
+    lines.append("IMPORTANT TRACKING GUIDANCE for updated note:")
+    lines.append("Track SIGNALS THAT INDICATE ROLE, especially:")
+    lines.append("- If player proposed a risky/unusual team → may indicate evil (trying to sneak evil past)")
+    lines.append("- If player is defensive about accusations → may indicate guilt")
+    lines.append("- If player changes story between rounds → may indicate deception")
+    lines.append("- If player aggressively accuses others → may indicate evil (trying to deflect)")
+    lines.append("- If player inconsistent in voting → may indicate hidden agenda")
+    lines.append("- If player defends counterintuitive choices → may indicate evil reasoning")
+    lines.append("")
+    lines.append("Constraints for updated note:")
+    lines.append("- Max 300 characters, focus on ROLE-RELEVANT signals.")
+    lines.append("- Track specific behaviors that hint at role (not neutral summaries).")
+    lines.append("- Example: 'Round 2: Pushed hard to include player-5, then defended choice aggressively when questioned'")
+    lines.append("")
+    lines.append(
+        "Respond ONLY with one-line JSON matching exactly this schema: "
+        '{"role":"<ROLE>","memory_note":"<DIAGNOSTIC_NOTE_300_CHARS>"}. '
+        "No markdown, no prose, no extra keys."
+    )
+
+    prompt = "\n".join(lines)
+    meta: Dict[str, Any] = {
+        "mode": "llm_self_note_evil_focused",
+        "self_note_enabled": True,
+        "self_note_focus": "evil_indicators",
+        "self_note_window_mode": window_selection,
+        "self_note_window_k": window_k,
+        "self_note_prev_total_count": len(prev_notes),
+        "self_note_prev_total_chars": sum(len(str(n)) for n in prev_notes),
+        "self_note_shown_count": len(notes_lines),
+        "self_note_shown_chars": len(notes_block) if notes_block != "(none yet)" else 0,
+        "self_note_prev_chars": len(notes_block) if notes_block != "(none yet)" else 0,
+        "self_note_prev_count": len(notes_lines),
+    }
+    return prompt, meta
+
+
 def postprocess_typechat_role_note(
     raw_pred: Optional[str],
     valid_roles: List[str],
